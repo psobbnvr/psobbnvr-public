@@ -1,0 +1,1 @@
+OpenVR SDK 2.15.6 (ValveSoftware/openvr commit 0924064), files: headers/openvr.h, lib/win32/openvr_api.lib, bin/win32/openvr_api.dll. BSD-3-Clause.

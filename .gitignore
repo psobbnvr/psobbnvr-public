@@ -1,0 +1,6 @@
+# Build output
+/mod/build*/
+
+# Local test copies of the game DLLs and logs
+*.log
+*.dmp
