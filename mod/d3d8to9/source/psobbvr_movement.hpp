@@ -742,7 +742,7 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
         // head's yaw (half the gap, capped 0x800), handed over through
         // follow_pending_* (AbsorbFollowStep). The attack hold's offset
         // also moves into follow_offset at the same rate (view unchanged),
-        // so the HUD (facing - hold_offset) comes round to the body.
+        // so it drains as the body re-follows the head.
         int follow_step = 0;
         if (body_follows_head && !v2_turn_only && !action_attacking) {
             const int gap = Wrap16(raw_yaw - (facing + 0x8000));

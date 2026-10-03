@@ -2,6 +2,13 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.2.0-beta (2026-10-03)
+
+- Added "HUD Height" Option in psobbvr_options.exe (VR settings tab). Decrease value to lower HUD.
+- Fixed "In front of your character" HUD position when head-based locomotion is enabled so that HUD smoothly returns to the center of your view as you turn.
+- Added option to enable IK arms. IK arms still need work, so they are added as an experimental option.
+- Adjusted default hand pitch.
+
 ## 0.1.0-beta-pub (2026-09-24)
 
 - Built from the public source code. Nothing changes in play: the same mod as 0.1.0-beta.

@@ -58,6 +58,7 @@ void LoadConfig() {
     read_float("far_m", 1.0f, 100000.0f, config.far_m);
     read_float("hud_distance_m", 0.1f, 50.0f, config.hud_distance_m);
     read_float("hud_width_deg", 10.0f, 160.0f, config.hud_width_deg);
+    read_float("hud_height_deg", -30.001f, 10.001f, config.hud_height_deg);
     read_float("text_scale", 0.049f, 3.001f, config.text_scale);
     config.hud_layer = GetPrivateProfileIntA("vr", "hud_layer", 1, path) != 0;
     const int hud_tex_w = GetPrivateProfileIntA("vr", "hud_tex_width", 1600, path);
@@ -66,6 +67,9 @@ void LoadConfig() {
     const int hud_lock = GetPrivateProfileIntA("vr", "hud_lock", 1, path);
     if (hud_lock >= 0 && hud_lock <= 2)
         config.hud_lock = hud_lock;
+    read_float("hud_follow_deg", -0.001f, 90.001f, config.hud_follow_deg);
+    read_float("hud_follow_wait_s", -0.001f, 5.001f, config.hud_follow_wait_s);
+    read_float("hud_follow_glide_s", 0.049f, 3.001f, config.hud_follow_glide_s);
     config.vr_keyboard = GetPrivateProfileIntA("vr", "vr_keyboard", 1, path) != 0;
     read_float("keyboard_distance_m", 0.2f, 3.0f, config.keyboard_distance_m);
     read_float("keyboard_drop_m", -1.0f, 1.5f, config.keyboard_drop_m);
@@ -301,6 +305,27 @@ void LoadConfig() {
     read_float("fist_fwd_cm", -50.001f, 50.001f, config.fist_fwd_cm);
     read_float("fist_up_cm", -50.001f, 50.001f, config.fist_up_cm);
     read_float("fist_side_cm", -50.001f, 50.001f, config.fist_side_cm);
+    // IK arms (psobbvr_ikarms.hpp).
+    {
+        const int ik = GetPrivateProfileIntA("vr", "ik_arms", 0, path);
+        if (ik >= 0 && ik <= 2)
+            config.ik_arms = ik;
+    }
+    read_float("ik_pole_out", -5.001f, 5.001f, config.ik_pole_out);
+    read_float("ik_pole_down", -5.001f, 5.001f, config.ik_pole_down);
+    read_float("ik_pole_back", -5.001f, 5.001f, config.ik_pole_back);
+    read_float("ik_raise_cm", -30.001f, 30.001f, config.ik_raise_cm);
+    read_float("ik_shoulder_up_cm", -30.001f, 30.001f, config.ik_shoulder_up_cm);
+    read_float("ik_shoulder_fwd_cm", -30.001f, 30.001f, config.ik_shoulder_fwd_cm);
+    read_float("ik_shoulder_in_cm", -30.001f, 30.001f, config.ik_shoulder_in_cm);
+    read_float("ik_twist", -0.001f, 1.001f, config.ik_twist);
+    {
+        const int anchor = GetPrivateProfileIntA("vr", "ik_anchor", 2, path);
+        if (anchor >= 0 && anchor <= 2)
+            config.ik_anchor = anchor;
+    }
+    read_float("ik_neck_down_cm", -30.001f, 30.001f, config.ik_neck_down_cm);
+    read_float("ik_neck_back_cm", -30.001f, 30.001f, config.ik_neck_back_cm);
 
     // Launch summary for bug reports: the build, the ini values that shape
     // a session, and the files the VR path depends on (psobbvr-vr.log).
@@ -314,14 +339,18 @@ void LoadConfig() {
               PSOBBVR_GIT_REV, __DATE__, __TIME__, path);
     diag::Log("launch: [vr] enabled=%d backend=%s controllers=%d "
               "stick_locomotion=%d head_move=%d world_scale=%.2f eye_height_auto=%d "
-              "eye_offset_m=%.2f hand_presence=%d hud_layer=%d hud_lock=%d menu_lock=%d "
+              "eye_offset_m=%.2f hand_presence=%d ik_arms=%d hud_layer=%d hud_lock=%d "
+              "hud_follow=%.0f/%.2f/%.2f menu_lock=%d "
               "allow_any_runtime=%d vr_fail_message=%d vr_fail_exit=%d; [bindings] %s",
               config.enabled ? 1 : 0, config.backend_openxr ? "openxr" : "openvr",
               config.controllers ? 1 : 0, config.stick_locomotion ? 1 : 0,
               config.head_move,
               config.world_scale, config.eye_height_auto, config.eye_offset_m,
-              config.hand_presence ? 1 : 0, config.hud_layer ? 1 : 0,
-              config.hud_lock, config.menu_lock ? 1 : 0, config.allow_any_runtime ? 1 : 0,
+              config.hand_presence ? 1 : 0, config.ik_arms,
+              config.hud_layer ? 1 : 0,
+              config.hud_lock, config.hud_follow_deg, config.hud_follow_wait_s,
+              config.hud_follow_glide_s, config.menu_lock ? 1 : 0,
+              config.allow_any_runtime ? 1 : 0,
               config.vr_fail_message ? 1 : 0, config.vr_fail_exit ? 1 : 0,
               bind_n > 0 ? "section present" : "section absent (defaults)");
     diag::Log("launch: openvr_api.dll %s, openxr_loader.dll %s",
@@ -654,6 +683,10 @@ public:
         const float half_w = config.hud_distance_m *
                              tanf(config.hud_width_deg * (3.14159265f / 360.0f));
         const float half_h = half_w * (480.0f / 640.0f);
+        // Screen centre height: hud_height_deg above the head's line of
+        // sight, the plane itself staying upright at the same depth.
+        const float cy = config.hud_distance_m *
+                         tanf(config.hud_height_deg * (3.14159265f / 180.0f));
         // View tangent -> NDC -> target pixel for the screen's edges; the
         // affine coefficients follow from the two ends of each axis.
         auto ndc_x = [&](float u) {  // u: -1 = UI left edge, +1 = right
@@ -661,7 +694,7 @@ public:
             return (2.0f * tan_x - r - l) / (r - l);
         };
         auto ndc_y = [&](float v) {  // v: +1 = UI top edge, -1 = bottom
-            const float tan_y = (v * half_h - ty) / dist;
+            const float tan_y = (cy + v * half_h - ty) / dist;
             return (2.0f * tan_y - up - down) / (up - down);
         };
         const float px_left = (ndc_x(-1.0f) + 1.0f) * 0.5f * eye_width;

@@ -676,6 +676,8 @@ inline void DrawNow(IDirect3DDevice9* dev, const char* trigger);
 inline bool Gated() {
     if (!vrmod::config.hand_presence || !HaveHand())
         return true;
+    if (vrmod::config.ik_arms != 0)
+        return true;  // the game's own hands are posed at the controllers
     if (resolution::passthrough || !stereo::WantsDuplication())
         return true;
     if (!gamecam::DrivesView())

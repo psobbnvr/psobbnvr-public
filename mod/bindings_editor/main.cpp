@@ -755,7 +755,7 @@ struct Knob {
 
 // The settings shown; everything else stays ini-only. The mod reads them
 // at launch.
-const Knob kKnobs[] = {
+constexpr Knob kKnobs[] = {
     // --- Comfort and view
     {"render", "width", "Resolution per eye", K_RESOLUTION, 0, 0, "2880x2160",
      "1920x1440=1920x1440|2304x1728=2304x1728|2560x1920=2560x1920|2880x2160=2880x2160|3200x2400=3200x2400",
@@ -770,10 +770,13 @@ const Knob kKnobs[] = {
      "How far away the HUD floats."},
     {"vr", "hud_width_deg", "HUD width (degrees)", K_INT, 30, 110, "60", nullptr,
      "How much of your view the HUD covers, side to side."},
+    {"vr", "hud_height_deg", "HUD height (degrees)", K_INT, -30, 10, "0", nullptr,
+     "Raises or lowers the HUD. 0 = centred at eye level; negative values lower it so you look slightly down at it."},
     {"vr", "hud_lock", "HUD position", K_CHOICE, 0, 0, "1",
      "In front of your character=1|Fixed in the room=2|Follows your head=0",
-     "In front of your character: stays put while you look around and turns when you turn. "
-     "Fixed in the room: stays where you faced at your last recenter. Follows your head: always in view."},
+     "In front of your character: stays put while you look around and turns when you turn "
+     "(with head-based locomotion: slowly follows your gaze). "
+     "Fixed in the room: where you faced at your last recenter. Follows your head: always in view."},
     {"vr", "vr_keyboard", "On-screen keyboard", K_BOOL, 0, 1, "1", nullptr,
      "Shows a keyboard whenever the game asks for text (chat, login, names). Point at a key and pull the trigger."},
     {"vr", "menu_distance_m", "Menu distance (m)", K_FLOAT, 1, 5, "2.0", nullptr,
@@ -796,6 +799,9 @@ const Knob kKnobs[] = {
     // --- Hands and combat
     {"vr", "hand_presence", "Show hands", K_BOOL, 0, 1, "1", nullptr,
      "Draws your character's hands on the controllers."},
+    {"vr", "ik_arms", "IK arms (experimental)", K_BOOL, 0, 1, "0", nullptr,
+     "Draws your character's whole arms, reaching for your controllers with the elbows bent to fit, "
+     "in place of the hands alone. Still being tuned."},
     {"vr", "weapon_scale", "Hand and weapon size", K_FLOAT, 0.1, 2, "0.7", nullptr,
      "Size of your hands and held weapon. 1 = the game's original (oversized) models.", "hand_scale"},
     {"vr", "hand_pitch_deg", "Hand angle (degrees)", K_FLOAT, -45, 45, "-10", nullptr,
@@ -825,10 +831,30 @@ const Knob kKnobs[] = {
      "Writes psobbvr-vr.log in the game folder (the last three launches are kept). Send it with bug reports."},
 };
 constexpr int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
-// First knob of each group. The first two groups share the left column.
-constexpr int kGroupStarts[] = {0, 11, 15, 26};
+
+constexpr bool KeyEquals(const char* a, const char* b) {
+    while (*a != '\0' && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+// Index of the knob with this ini key, or -1.
+constexpr int KnobIndex(const char* key) {
+    for (int i = 0; i < kKnobCount; i++)
+        if (KeyEquals(kKnobs[i].key, key))
+            return i;
+    return -1;
+}
+// First knob of each group, found by its key so adding a row cannot move
+// a group boundary. The first two groups share the left column.
+constexpr int kGroupStarts[] = {0, KnobIndex("stick_turn_deg_s"), KnobIndex("hand_presence"),
+                                KnobIndex("enabled")};
 const char* kGroupNames[] = {"Comfort and view", "Movement", "Hands and combat", "Troubleshooting"};
 constexpr int kGroupCount = sizeof(kGroupStarts) / sizeof(kGroupStarts[0]);
+static_assert(kGroupStarts[0] < kGroupStarts[1] && kGroupStarts[1] < kGroupStarts[2] &&
+                  kGroupStarts[2] < kGroupStarts[3],
+              "a group's first key is missing from kKnobs or out of order");
 HWND g_knob[kKnobCount] = {};
 
 // K_CHOICE helpers: parse "label=value|label=value".

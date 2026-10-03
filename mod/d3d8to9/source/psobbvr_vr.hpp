@@ -24,6 +24,7 @@
 //                    ;   game's own depth rows when available)
 //   hud_distance_m=1.5  ; 2D UI virtual screen: how far in front of the head
 //   hud_width_deg=60    ; ...and the horizontal angle it spans
+//   hud_height_deg=0    ; ...and how far above eye level, in degrees
 
 #include <windows.h>
 #include <d3d9.h>
@@ -46,6 +47,11 @@ struct Config {
     // part.
     float hud_distance_m = 1.5f;
     float hud_width_deg = 60.0f;
+    // Degrees the HUD's centre sits above eye level (negative lowers it),
+    // in every HUD mode. The quad layer is also pitched to face the eye;
+    // the baked per-eye remap is affine, so it can only shift the screen,
+    // untilted.
+    float hud_height_deg = 0.0f;
     // Combat-text size multiplier. 1.0 = the flat game's angular size
     // (see ProjectCombatTextVertices).
     float text_scale = 0.5f;
@@ -60,8 +66,12 @@ struct Config {
     // in front of the character's facing: head turns leave it in place, it
     // turns with the character (smoothed). 2 = fixed in the room along the
     // view's forward. Locked modes follow the head's position. OpenXR quad
-    // layer only.
+    // layer only. With head_move 2, mode 1 follows the head's yaw through a
+    // dead zone instead (hud_follow_*, gamecam::HudGazeFollow).
     int hud_lock = 1;
+    float hud_follow_deg = 10.0f;
+    float hud_follow_wait_s = 0.0f;
+    float hud_follow_glide_s = 1.2f;
     // On-screen keyboard (psobbvr_vrkeyboard.hpp): a
     // panel below eye level while the game has a text field open, driven
     // by the controllers' aim rays and triggers. Placement: distance
@@ -568,7 +578,7 @@ struct Config {
     // are oversized for third person). 1 = authored size. Boxed passes and
     // the animation-riding fallback keep the authored size.
     float weapon_scale = 0.7f;
-    float grip_pitch_deg = -10.0f;
+    float grip_pitch_deg = 0.0f;
     float grip_roll_deg = 180.0f;
     float grip_yaw_deg = 0.0f;
     float grip_fwd_cm = -3.0f;
@@ -623,6 +633,40 @@ struct Config {
     // hand-band run), consumed by hands::OnFrame.
     int handcap_first = 0;
     int handcap_last = 0;
+    // IK arms (psobbvr_ikarms.hpp): the character's own arms reach the
+    // controllers. 0 off, 1 on, 2 a fixed test pose. While on, the arm hide
+    // and the drawn hands stand down.
+    int ik_arms = 0;
+    // The elbow's pole direction in the character's frame, mirrored per
+    // arm: out to the side, down, and back.
+    float ik_pole_out = 0.4f;
+    float ik_pole_down = 1.0f;
+    float ik_pole_back = 0.3f;
+    // Raise the chest, shoulders and arms by this much while posing (the
+    // neck and head stay put): the camera sits above the head, so the
+    // character's shoulders feel low.
+    float ik_raise_cm = 0.0f;
+    // Move just the shoulder joints (and the arms on them) while posing:
+    // up, forward, and in toward the middle.
+    float ik_shoulder_up_cm = 10.0f;
+    float ik_shoulder_fwd_cm = 0.0f;
+    float ik_shoulder_in_cm = 0.0f;
+    // Hold the shoulders and hands at their idle pose while the character
+    // animates, so the arms follow only the controllers. 0 off, 1 held on
+    // the body, 2 also moved with the headset.
+    int ik_anchor = 2;
+    // ik_anchor 2: the neck point the shoulders follow, below and behind
+    // the tracked head (centimeters, head frame), so turning or tipping
+    // the head about the neck leaves the shoulders still.
+    float ik_neck_down_cm = 7.5f;
+    float ik_neck_back_cm = 8.0f;
+    // How much of the hand's roll the forearm takes (0..1); the wrist
+    // takes the rest.
+    float ik_twist = 0.65f;
+    // Developer-build one-shots: log this many posed walks; log the
+    // status line.
+    int ik_trace_request = 0;
+    bool ik_status_request = false;
 };
 
 inline Config config;

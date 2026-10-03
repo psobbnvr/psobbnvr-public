@@ -22,6 +22,7 @@
 #include "psobbvr_partmap.hpp"
 #include "psobbvr_weapongrip.hpp"
 #include "psobbvr_hands.hpp"
+#include "psobbvr_ikarms.hpp"
 #include "psobbvr_targetaim.hpp"
 #include "psobbvr_gunfire.hpp"
 #include "psobbvr_techcast.hpp"
@@ -877,6 +878,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: equipment draw bracket for the weapon-on-grip re-seat
 	// (psobbvr_weapongrip.hpp).
 	weapongrip::Install();
+	// psobbvr: the player draw walk + per-bone callback hooks behind the
+	// IK arms (psobbvr_ikarms.hpp); installed only once ik_arms is on.
+	ikarms::Install();
 	// psobbvr: target-selection aim steering (psobbvr_targetaim.hpp).
 	targetaim::Install();
 	// psobbvr: gun bullet origin at the hand (psobbvr_gunfire.hpp).
@@ -908,6 +912,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: VR hands capture/replay per-pass state; after weapongrip
 	// so the hand-bone stash validity flags are fresh.
 	hands::OnFrame();
+	// psobbvr: IK arms targets for this frame (psobbvr_ikarms.hpp); after
+	// weapongrip (the grip tuple) and Apply (the takeover pose).
+	ikarms::OnFrame();
 	// psobbvr: this frame's aim yaw for the target-selection facing swap;
 	// after weapongrip (current_is_gun) and Apply (gaze/anchor).
 	targetaim::OnFrame();

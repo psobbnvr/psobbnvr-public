@@ -557,27 +557,37 @@ public:
                 PlaceMenuQuad(quad, config.menu_distance_m);
             } else if (config.hud_lock != 0 && hud_anchor_valid_ &&
                        head_xr_valid_) {
-                // HUD lock: level in LOCAL space, hud_distance_m from the
-                // head along the published forward (Config::hud_lock),
-                // facing the head. Yaw-only quaternion about +y; the quad's
-                // local -z is its forward, so theta = atan2(-fx, -fz).
+                // HUD lock: in LOCAL space, hud_distance_m from the head
+                // along the published forward (Config::hud_lock), dropped
+                // by drop = -hud_height_deg below the horizon and facing the
+                // head. Yaw about +y (the quad's local -z is its forward, so
+                // theta = atan2(-fx, -fz)), then pitch about the quad's own x
+                // by -drop so its face points back at the eye: q = yaw*pitch.
                 const float d = config.hud_distance_m;
                 const float theta = atan2f(-hud_anchor_fx_, -hud_anchor_fz_);
+                const float drop = -config.hud_height_deg * (3.14159265f / 180.0f);
+                const float ys = sinf(0.5f * theta), yc = cosf(0.5f * theta);
+                const float ps = -sinf(0.5f * drop), pc = cosf(0.5f * drop);
+                const float ahead = d * cosf(drop);
                 quad.space = local_space_;
-                quad.pose.orientation = {0.0f, sinf(0.5f * theta), 0.0f,
-                                         cosf(0.5f * theta)};
+                quad.pose.orientation = {yc * ps, ys * pc, -ys * ps, yc * pc};
                 quad.pose.position = {
-                    head_xr_pose_.position.x + hud_anchor_fx_ * d,
-                    head_xr_pose_.position.y,
-                    head_xr_pose_.position.z + hud_anchor_fz_ * d};
+                    head_xr_pose_.position.x + hud_anchor_fx_ * ahead,
+                    head_xr_pose_.position.y - d * sinf(drop),
+                    head_xr_pose_.position.z + hud_anchor_fz_ * ahead};
                 quad.size.width = 2.0f * d *
                                   tanf(config.hud_width_deg * (3.14159265f / 360.0f));
                 quad.size.height = quad.size.width * (480.0f / 640.0f);
             } else {
+                // Head-locked: drop = -hud_height_deg below the line of
+                // sight, pitched about x by -drop to face the eye.
+                const float d = config.hud_distance_m;
+                const float drop = -config.hud_height_deg * (3.14159265f / 180.0f);
                 quad.space = view_space_;
-                quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-                quad.pose.position = {0.0f, 0.0f, -config.hud_distance_m};
-                quad.size.width = 2.0f * config.hud_distance_m *
+                quad.pose.orientation = {-sinf(0.5f * drop), 0.0f, 0.0f,
+                                         cosf(0.5f * drop)};
+                quad.pose.position = {0.0f, -d * sinf(drop), -d * cosf(drop)};
+                quad.size.width = 2.0f * d *
                                   tanf(config.hud_width_deg * (3.14159265f / 360.0f));
                 quad.size.height = quad.size.width * (480.0f / 640.0f);
             }
@@ -871,12 +881,14 @@ public:
         const float half_w = config.hud_distance_m *
                              tanf(config.hud_width_deg * (3.14159265f / 360.0f));
         const float half_h = half_w * (480.0f / 640.0f);
+        const float cy = config.hud_distance_m *
+                         tanf(config.hud_height_deg * (3.14159265f / 180.0f));
         auto ndc_x = [&](float u) {
             const float tan_x = (u * half_w - tx) / dist;
             return (2.0f * tan_x - r - l) / (r - l);
         };
         auto ndc_y = [&](float v) {
-            const float tan_y = (v * half_h - ty) / dist;
+            const float tan_y = (cy + v * half_h - ty) / dist;
             return (2.0f * tan_y - up - down) / (up - down);
         };
         const float px_left = (ndc_x(-1.0f) + 1.0f) * 0.5f * eye_width;

@@ -96,8 +96,9 @@ inline bool HideArmDrawNow() {
     if (!body_run_open)
         return false;
     body_run_draws++;
-    return vrmod::config.hide_arms && gamecam::DrivesView() &&
-           body_run_draws <= vrmod::config.hide_arms_count;
+    // IK arms pose the arms to the controllers, so they stay visible.
+    return vrmod::config.hide_arms && vrmod::config.ik_arms == 0 &&
+           gamecam::DrivesView() && body_run_draws <= vrmod::config.hide_arms_count;
 }
 
 

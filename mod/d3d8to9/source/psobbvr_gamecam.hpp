@@ -109,13 +109,87 @@ inline float anchor_hx = 0.0f, anchor_hz = -1.0f;
 inline float follow_dx = 0.0f, follow_dz = -1.0f;
 constexpr float FOLLOW_ALPHA = 0.2f;  // per Apply (~2x/frame): ~0.2 s settle
 
-// HUD lock ([vr] hud_lock): the level forward direction the HUD faces,
-// sent to the backend each Apply (VRInterface::SetHudAnchor).
-// Mode 1: the character's facing minus the attack view hold, so attack
-// turns don't move the HUD. Mode 2: the view's forward. Smoothed with
-// FOLLOW_ALPHA; recenter re-seeds.
+// HUD lock ([vr] hud_lock): the level forward direction the HUD faces
+// (tracking space), sent each Apply (VRInterface::SetHudAnchor). Both
+// modes use the view's forward, which only stick turns move. Mode 1 is
+// smoothed with FOLLOW_ALPHA, or with head_move 2 follows the head through
+// a dead zone (HudGazeFollow). Recenter re-seeds.
 inline float hud_fx = 0.0f, hud_fz = -1.0f;
 inline bool hud_reseed = true;
+
+// The dead-zoned gaze follow: the HUD rests until the head has stayed more
+// than hud_follow_deg from it for hud_follow_wait_s, then glides back in
+// front of the head on a critically damped spring and rests again.
+inline bool hud_gaze_gliding = false;
+inline float hud_gaze_away_s = 0.0f;  // time the head has spent outside
+inline float hud_gaze_vel = 0.0f;     // glide speed, radians per second
+inline double hud_gaze_prev_t = 0.0;  // 0 = no previous call
+
+inline void HudGazeReset() {
+    hud_gaze_gliding = false;
+    hud_gaze_away_s = 0.0f;
+    hud_gaze_vel = 0.0f;
+    hud_gaze_prev_t = 0.0;
+}
+
+// One step of the gaze follow on hud_fx/hud_fz; head = the tracking-space
+// head pose.
+inline void HudGazeFollow(const D3DMATRIX& head) {
+    const double now = vrmod::NowSeconds();
+    float dt = hud_gaze_prev_t > 0.0 ? static_cast<float>(now - hud_gaze_prev_t) : 0.0f;
+    hud_gaze_prev_t = now;
+    if (dt > 0.1f)
+        dt = 0.1f;  // a hitch must not count as a long look away
+    // The head's yaw (forward is -(row 3)); near straight up or down it has
+    // none, so hold.
+    float hx = -head._31, hz = -head._33;
+    const float hn = sqrtf(hx * hx + hz * hz);
+    if (hn < 0.2f)
+        return;
+    hx /= hn;
+    hz /= hn;
+    // Signed angle that turns the HUD's direction onto the head's.
+    const float gap = atan2f(hud_fx * hz - hud_fz * hx, hud_fx * hx + hud_fz * hz);
+    if (!hud_gaze_gliding) {
+        if (fabsf(gap) <= vrmod::config.hud_follow_deg * (3.14159265f / 180.0f)) {
+            hud_gaze_away_s = 0.0f;
+            return;
+        }
+        hud_gaze_away_s += dt;
+        if (hud_gaze_away_s < vrmod::config.hud_follow_wait_s)
+            return;
+        diag::Log("hudfollow: head %+.0f deg off the HUD for %.2f s, gliding",
+                  gap * 57.2958f, hud_gaze_away_s);
+        hud_gaze_gliding = true;
+        hud_gaze_away_s = 0.0f;
+        hud_gaze_vel = 0.0f;
+    }
+    // Critically damped spring toward the head, in the closed form that is
+    // stable at any dt (Game Programming Gems 4, 1.10): starts from rest,
+    // so the HUD eases off rather than jumping, and settles to 5% in
+    // hud_follow_glide_s.
+    const float omega = 4.74f / vrmod::config.hud_follow_glide_s;
+    const float x = omega * dt;
+    const float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+    const float temp = (hud_gaze_vel - omega * gap) * dt;
+    hud_gaze_vel = (hud_gaze_vel - omega * temp) * decay;
+    float step = gap + (temp - gap) * decay;
+    if ((gap > 0.0f) == (step > gap)) {  // never overshoot the head
+        step = gap;
+        hud_gaze_vel = 0.0f;
+    }
+    const float c = cosf(step), s = sinf(step);
+    const float nx = hud_fx * c - hud_fz * s;
+    const float nz = hud_fx * s + hud_fz * c;
+    const float nn = sqrtf(nx * nx + nz * nz);
+    hud_fx = nx / nn;
+    hud_fz = nz / nn;
+    // Caught up (within a degree, nearly still): rest again.
+    if (fabsf(gap - step) < 0.0175f && fabsf(hud_gaze_vel) < 0.1f) {
+        hud_gaze_gliding = false;
+        hud_gaze_vel = 0.0f;
+    }
+}
 
 // Attack view hold ([vr] attack_view_hold): an attack turns the
 // character toward its target without turning the view. Facing changes
@@ -161,6 +235,9 @@ inline bool written_this_frame = false;
 // The raw tracked head pose world_from_head was built from this frame.
 // See WorldFromTracking.
 inline D3DMATRIX head_at_apply = vrmod::Identity();
+// The eye level above the feet this frame (game units): with the head at
+// its recentered place, the camera sits this far above the feet.
+inline float eye_units_at_apply = 0.0f;
 
 // Position + target last written by Apply(), re-written by the update
 // hook after the game's camera logic runs (only while written_this_frame,
@@ -500,6 +577,7 @@ inline void Apply() {
     if (vrmod::config.eye_height_auto && eyeheight::Valid())
         eye_units = eyeheight::Units() +
                     vrmod::config.eye_offset_m * vrmod::config.world_scale;
+    eye_units_at_apply = eye_units;
     const float eye_y = feet[1] + eye_units;
     const float eye_z = feet[2];
     anchor._41 = eye_x - (anchor_p0[0] * anchor._11 + anchor_p0[2] * anchor._31);
@@ -507,24 +585,24 @@ inline void Apply() {
     anchor._43 = eye_z - (anchor_p0[0] * anchor._13 + anchor_p0[2] * anchor._33);
 
     // HUD lock: the view's forward; then world -> tracking by the
-    // transposed anchor rotation.
+    // transposed anchor rotation. Mode 1 with head-directed walking follows
+    // the head instead, through the dead zone: following the body would
+    // drag the HUD to wherever the head looked while walking.
     {
-        float wx = fwd_dx, wz = fwd_dz;
-        if (vrmod::config.hud_lock == 1 && vrmod::config.head_move == 2) {
-            // head_move 2: facing less the attack hold, so the HUD comes
-            // round with the walked head-follow turns (the view does not).
-            const float h_theta =
-                (live_bams - (vrmod::config.attack_view_hold ? hold_offset : 0)) *
-                (6.2831853f / 65536.0f);
-            wx = sinf(h_theta);
-            wz = cosf(h_theta);
-        }
+        const float wx = fwd_dx, wz = fwd_dz;
         const float tx = wx * anchor._11 + wz * anchor._13;
         const float tz = wx * anchor._31 + wz * anchor._33;
+        const bool gaze_follow = vrmod::config.hud_lock == 1 &&
+                                 vrmod::config.head_move == 2 && have_pose;
+        if (!gaze_follow)
+            HudGazeReset();
         if (hud_reseed || vrmod::config.hud_lock != 1) {
             hud_fx = tx;
             hud_fz = tz;
             hud_reseed = false;
+            HudGazeReset();
+        } else if (gaze_follow) {
+            HudGazeFollow(head);
         } else {
             hud_fx += (tx - hud_fx) * FOLLOW_ALPHA;
             hud_fz += (tz - hud_fz) * FOLLOW_ALPHA;
