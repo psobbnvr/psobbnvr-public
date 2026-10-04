@@ -730,6 +730,121 @@ inline void Quad(IDirect3DDevice9* dev, float cx, float cy, float hw, float hh,
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(Vtx));
 }
 
+// The device state a HUD sprite draw touches, saved on entry and restored on
+// exit; in between the HUD layer is bound and the sprite states are set
+// (pre-transformed textured quads, alpha blending, coverage into the HUD
+// texture's alpha as the game's own UI draws get).
+struct HudSpriteScope {
+    static constexpr D3DRENDERSTATETYPE kRs[] = {
+        D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+        D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA,
+        D3DRS_DESTBLENDALPHA, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE,
+        D3DRS_CULLMODE, D3DRS_LIGHTING, D3DRS_FOGENABLE,
+        D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE, D3DRS_BLENDOP};
+    static constexpr D3DTEXTURESTAGESTATETYPE kTs[] = {
+        D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_ALPHAOP,
+        D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_TEXCOORDINDEX};
+    static constexpr D3DSAMPLERSTATETYPE kSs[] = {
+        D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+        D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV};
+    static constexpr size_t kNRs = sizeof(kRs) / sizeof(kRs[0]);
+    static constexpr size_t kNTs = sizeof(kTs) / sizeof(kTs[0]);
+    static constexpr size_t kNSs = sizeof(kSs) / sizeof(kSs[0]);
+
+    IDirect3DDevice9* dev;
+    IDirect3DSurface9* saved_rt = nullptr;
+    IDirect3DSurface9* saved_ds = nullptr;
+    D3DVIEWPORT9 saved_vp = {};
+    DWORD saved_fvf = 0;
+    IDirect3DBaseTexture9* saved_tex = nullptr;
+    DWORD rs_saved[kNRs] = {};
+    DWORD ts_saved[kNTs] = {};
+    DWORD saved_stage1_color = 0, saved_stage1_alpha = 0;
+    DWORD ss_saved[kNSs] = {};
+    IDirect3DVertexShader9* saved_vs = nullptr;
+    IDirect3DPixelShader9* saved_ps = nullptr;
+
+    explicit HudSpriteScope(IDirect3DDevice9* d) : dev(d) {
+        dev->GetRenderTarget(0, &saved_rt);
+        dev->GetDepthStencilSurface(&saved_ds);
+        dev->GetViewport(&saved_vp);
+        dev->GetFVF(&saved_fvf);
+        dev->GetTexture(0, &saved_tex);
+        for (size_t i = 0; i < kNRs; i++)
+            dev->GetRenderState(kRs[i], &rs_saved[i]);
+        for (size_t i = 0; i < kNTs; i++)
+            dev->GetTextureStageState(0, kTs[i], &ts_saved[i]);
+        dev->GetTextureStageState(1, D3DTSS_COLOROP, &saved_stage1_color);
+        dev->GetTextureStageState(1, D3DTSS_ALPHAOP, &saved_stage1_alpha);
+        for (size_t i = 0; i < kNSs; i++)
+            dev->GetSamplerState(0, kSs[i], &ss_saved[i]);
+        dev->GetVertexShader(&saved_vs);
+        dev->GetPixelShader(&saved_ps);
+        dev->BeginScene();
+        stereo::BindHudLayer(dev, false, true);
+        dev->SetVertexShader(nullptr);
+        dev->SetPixelShader(nullptr);
+        dev->SetFVF(VTX_FVF);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        // Coverage into the HUD texture's alpha, as the game's own UI draws
+        // get (stereo::ApplyCoverageAlpha): the quad is composited by alpha.
+        dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+        dev->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+        dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    }
+
+    ~HudSpriteScope() {
+        dev->EndScene();
+        dev->SetVertexShader(saved_vs);
+        dev->SetPixelShader(saved_ps);
+        if (saved_vs) saved_vs->Release();
+        if (saved_ps) saved_ps->Release();
+        for (size_t i = 0; i < kNSs; i++)
+            dev->SetSamplerState(0, kSs[i], ss_saved[i]);
+        dev->SetTextureStageState(1, D3DTSS_COLOROP, saved_stage1_color);
+        dev->SetTextureStageState(1, D3DTSS_ALPHAOP, saved_stage1_alpha);
+        for (size_t i = 0; i < kNTs; i++)
+            dev->SetTextureStageState(0, kTs[i], ts_saved[i]);
+        for (size_t i = 0; i < kNRs; i++)
+            dev->SetRenderState(kRs[i], rs_saved[i]);
+        dev->SetTexture(0, saved_tex);
+        if (saved_tex) saved_tex->Release();
+        dev->SetFVF(saved_fvf);
+        dev->SetRenderTarget(0, saved_rt);
+        dev->SetDepthStencilSurface(saved_ds);
+        dev->SetViewport(&saved_vp);
+        if (saved_rt) saved_rt->Release();
+        if (saved_ds) saved_ds->Release();
+    }
+
+    HudSpriteScope(const HudSpriteScope&) = delete;
+    HudSpriteScope& operator=(const HudSpriteScope&) = delete;
+};
+
 // Called from Present, after the stereo composite and before the HUD
 // texture is submitted: one draw per frame, on top of the game's HUD.
 inline void Draw(IDirect3DDevice9* dev) {
@@ -742,80 +857,7 @@ inline void Draw(IDirect3DDevice9* dev) {
     if (!EnsureAssets(dev))
         return;
 
-    IDirect3DSurface9* saved_rt = nullptr;
-    IDirect3DSurface9* saved_ds = nullptr;
-    dev->GetRenderTarget(0, &saved_rt);
-    dev->GetDepthStencilSurface(&saved_ds);
-    D3DVIEWPORT9 saved_vp;
-    dev->GetViewport(&saved_vp);
-    DWORD saved_fvf = 0;
-    dev->GetFVF(&saved_fvf);
-    IDirect3DBaseTexture9* saved_tex = nullptr;
-    dev->GetTexture(0, &saved_tex);
-    const D3DRENDERSTATETYPE rs_ids[] = {
-        D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
-        D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA,
-        D3DRS_DESTBLENDALPHA, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE,
-        D3DRS_CULLMODE, D3DRS_LIGHTING, D3DRS_FOGENABLE,
-        D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE, D3DRS_BLENDOP};
-    DWORD rs_saved[sizeof(rs_ids) / sizeof(rs_ids[0])];
-    for (size_t i = 0; i < sizeof(rs_ids) / sizeof(rs_ids[0]); i++)
-        dev->GetRenderState(rs_ids[i], &rs_saved[i]);
-    const D3DTEXTURESTAGESTATETYPE ts_ids[] = {
-        D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_ALPHAOP,
-        D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_TEXCOORDINDEX};
-    DWORD ts_saved[sizeof(ts_ids) / sizeof(ts_ids[0])];
-    for (size_t i = 0; i < sizeof(ts_ids) / sizeof(ts_ids[0]); i++)
-        dev->GetTextureStageState(0, ts_ids[i], &ts_saved[i]);
-    DWORD saved_stage1_color = 0, saved_stage1_alpha = 0;
-    dev->GetTextureStageState(1, D3DTSS_COLOROP, &saved_stage1_color);
-    dev->GetTextureStageState(1, D3DTSS_ALPHAOP, &saved_stage1_alpha);
-    const D3DSAMPLERSTATETYPE ss_ids[] = {D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-                                         D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU,
-                                         D3DSAMP_ADDRESSV};
-    DWORD ss_saved[sizeof(ss_ids) / sizeof(ss_ids[0])];
-    for (size_t i = 0; i < sizeof(ss_ids) / sizeof(ss_ids[0]); i++)
-        dev->GetSamplerState(0, ss_ids[i], &ss_saved[i]);
-    IDirect3DVertexShader9* saved_vs = nullptr;
-    IDirect3DPixelShader9* saved_ps = nullptr;
-    dev->GetVertexShader(&saved_vs);
-    dev->GetPixelShader(&saved_ps);
-
-    dev->BeginScene();
-    stereo::BindHudLayer(dev, false, true);
-    dev->SetVertexShader(nullptr);
-    dev->SetPixelShader(nullptr);
-    dev->SetFVF(VTX_FVF);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
-    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-    // Coverage into the HUD texture's alpha, as the game's own UI draws
-    // get (stereo::ApplyCoverageAlpha): the quad is composited by alpha.
-    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
-    dev->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
-    dev->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
-    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-    dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
-    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    HudSpriteScope scope(dev);
 
     const float cx = c.swing_indicator_x, cy = c.swing_indicator_y;
     if (view.ring) {
@@ -840,28 +882,6 @@ inline void Draw(IDirect3DDevice9* dev) {
         Quad(dev, cx, cy, HEX_CELL_W * 0.5f * s, HEX_CELL_H * 0.5f * s, u0, 0.0f,
              u1, v1, 0xFFFFFFFF);
     }
-    dev->EndScene();
-
-    dev->SetVertexShader(saved_vs);
-    dev->SetPixelShader(saved_ps);
-    if (saved_vs) saved_vs->Release();
-    if (saved_ps) saved_ps->Release();
-    for (size_t i = 0; i < sizeof(ss_ids) / sizeof(ss_ids[0]); i++)
-        dev->SetSamplerState(0, ss_ids[i], ss_saved[i]);
-    dev->SetTextureStageState(1, D3DTSS_COLOROP, saved_stage1_color);
-    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, saved_stage1_alpha);
-    for (size_t i = 0; i < sizeof(ts_ids) / sizeof(ts_ids[0]); i++)
-        dev->SetTextureStageState(0, ts_ids[i], ts_saved[i]);
-    for (size_t i = 0; i < sizeof(rs_ids) / sizeof(rs_ids[0]); i++)
-        dev->SetRenderState(rs_ids[i], rs_saved[i]);
-    dev->SetTexture(0, saved_tex);
-    if (saved_tex) saved_tex->Release();
-    dev->SetFVF(saved_fvf);
-    dev->SetRenderTarget(0, saved_rt);
-    dev->SetDepthStencilSurface(saved_ds);
-    dev->SetViewport(&saved_vp);
-    if (saved_rt) saved_rt->Release();
-    if (saved_ds) saved_ds->Release();
 }
 
 }  // namespace swingind

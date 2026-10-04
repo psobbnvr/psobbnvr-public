@@ -222,6 +222,51 @@ inline Arm arms[2];
 inline uintptr_t model_entity = 0;
 inline uintptr_t model_tree = 0;
 
+// Entering or leaving a game builds a new player entity, but the same
+// character has the same skeleton and idle animation, so its rest pose is
+// carried over: the old model's is stashed with its character key, and
+// restored once the new model's first walk has measured bone lengths that
+// match. The character's visual block (entity +0x940): class byte +0x961,
+// proportion sliders +0x978 / +0x97C.
+constexpr uintptr_t ENTITY_CLASS_OFFSET = 0x961;
+constexpr uintptr_t ENTITY_PROPORTION_OFFSET = 0x978;
+constexpr float REST_LENGTH_EPS = 0.01f;  // model units
+struct CharacterKey {
+    bool valid;
+    int class_id;
+    float proportion[2];
+};
+struct RestPose {
+    Vec3 idle_shoulder;
+    bool have_idle_shoulder;
+    D3DMATRIX idle_wrist_from_grip;
+    bool have_idle_wrist;
+    D3DMATRIX idle_hand[HAND_BONE_COUNT];
+    unsigned idle_hand_mask;
+    float upper_len, fore_len;
+};
+inline CharacterKey model_key = {};
+inline CharacterKey stash_key = {};
+inline RestPose stash[2] = {};
+inline bool stash_pending = false;
+
+inline CharacterKey ReadCharacterKey(uintptr_t entity) {
+    CharacterKey k = {};
+    if (diag::Accessible(entity + ENTITY_CLASS_OFFSET, 1, false) &&
+        diag::Accessible(entity + ENTITY_PROPORTION_OFFSET, 8, false)) {
+        k.class_id = *reinterpret_cast<const uint8_t*>(entity + ENTITY_CLASS_OFFSET);
+        memcpy(k.proportion, reinterpret_cast<const void*>(entity + ENTITY_PROPORTION_OFFSET),
+               sizeof(k.proportion));
+        k.valid = true;
+    }
+    return k;
+}
+
+inline bool SameCharacter(const CharacterKey& a, const CharacterKey& b) {
+    return a.valid && b.valid && a.class_id == b.class_id &&
+           a.proportion[0] == b.proportion[0] && a.proportion[1] == b.proportion[1];
+}
+
 // Walk state.
 inline bool walk_active = false;
 inline uintptr_t walk_bones = 0;
@@ -265,6 +310,63 @@ inline void ResetModel() {
         a.still_since = 0.0;
     }
     logged_first_pose = false;
+}
+
+// A new model replaces the current one: keep the rest pose for the check
+// after its first walk. A model that never recorded one leaves an earlier
+// stash pending.
+inline void StashRestPose() {
+    if (!arms[0].have_idle_shoulder && !arms[1].have_idle_shoulder)
+        return;
+    for (int side = 0; side < 2; side++) {
+        const Arm& a = arms[side];
+        RestPose& s = stash[side];
+        s.idle_shoulder = a.idle_shoulder;
+        s.have_idle_shoulder = a.have_idle_shoulder;
+        s.idle_wrist_from_grip = a.idle_wrist_from_grip;
+        s.have_idle_wrist = a.have_idle_wrist;
+        memcpy(s.idle_hand, a.idle_hand, sizeof(s.idle_hand));
+        s.idle_hand_mask = a.idle_hand_mask;
+        s.upper_len = a.upper_len;
+        s.fore_len = a.fore_len;
+    }
+    stash_key = model_key;
+    stash_pending = true;
+}
+
+// After a walk: once the new model's bone lengths are measured, restore
+// the stashed rest pose if it is the same character, else drop it.
+inline void CheckRestStash() {
+    if (!stash_pending)
+        return;
+    for (const Arm& a : arms)
+        if (!a.have_upper_len || !a.have_fore_len)
+            return;  // not measured yet
+    stash_pending = false;
+    float worst = 0.0f;
+    for (int side = 0; side < 2; side++) {
+        const float du = fabsf(arms[side].upper_len - stash[side].upper_len);
+        const float df = fabsf(arms[side].fore_len - stash[side].fore_len);
+        worst = du > worst ? du : worst;
+        worst = df > worst ? df : worst;
+    }
+    if (!SameCharacter(model_key, stash_key) || worst > REST_LENGTH_EPS) {
+        diag::Log("ikarms: rest pose dropped (%s; bone lengths differ by up to %.3f)",
+                  SameCharacter(model_key, stash_key) ? "same character" : "another character",
+                  worst);
+        return;
+    }
+    for (int side = 0; side < 2; side++) {
+        Arm& a = arms[side];
+        const RestPose& s = stash[side];
+        a.idle_shoulder = s.idle_shoulder;
+        a.have_idle_shoulder = s.have_idle_shoulder;
+        a.idle_wrist_from_grip = s.idle_wrist_from_grip;
+        a.have_idle_wrist = s.have_idle_wrist;
+        memcpy(a.idle_hand, s.idle_hand, sizeof(a.idle_hand));
+        a.idle_hand_mask = s.idle_hand_mask;
+    }
+    diag::Log("ikarms: rest pose kept (same character, bone lengths within %.3f)", worst);
 }
 
 // Two-bone solve in character space. S = shoulder, P = wrist target, a/b =
@@ -598,9 +700,11 @@ inline bool BeginWalk(uintptr_t entity) {
         !diag::Accessible(reinterpret_cast<uintptr_t>(top), sizeof(D3DMATRIX), false))
         return false;
     if (entity != model_entity || tree != model_tree) {
+        StashRestPose();
         model_entity = entity;
         model_tree = tree;
         ResetModel();
+        model_key = ReadCharacterKey(entity);
     }
     walk_root = *top;
     if (!AffineInverse(walk_root, walk_root_inv))
@@ -669,6 +773,7 @@ inline bool BeginWalk(uintptr_t entity) {
 inline void EndWalk() {
     walks_this_pass++;
     callbacks_last_walk = walk_callbacks;
+    CheckRestStash();
     const bool any = arms[0].posed || arms[1].posed;
     if (any)
         posed_this_pass++;

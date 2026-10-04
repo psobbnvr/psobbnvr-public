@@ -12,9 +12,12 @@
 //    learned, so the mag and weapon are never hidden.
 //  - The body, arms included, draws under the root matrix at the feet,
 //    outside both zones.
-// The learned set clears on floor change (textures are recreated). Only
-// active while VR drives the view. RHW/UI draws must not reach
-// SuppressNow (it learns as a side effect).
+// The learned set is kept across area changes (the character's textures
+// live for the whole game). d3d8to9 keeps one wrapper per D3D9 texture
+// address and hands it back when D3D9 reuses the address, so CreateTexture
+// is the one moment a learned pointer can start naming another texture:
+// OnTextureCreated forgets it there. Only active while VR drives the view.
+// RHW/UI draws must not reach SuppressNow (it learns as a side effect).
 
 #include "psobbvr_eyeheight.hpp"
 #include "psobbvr_gamecam.hpp"
@@ -46,11 +49,15 @@ inline DWORD game_cullmode = 3;  // shadows the game's D3DRS_CULLMODE
 // dereferenced).
 inline const void* current_texture = nullptr;
 
-// Learned head textures (usually 2-6); the cap limits damage if the anchor
-// goes wrong.
-inline const void* learned[16] = {};
+// BeginScene passes so far (two per game frame).
+inline int frame_counter = 0;
+
+// Learned head textures (usually 4-6 per character, new ones each time a
+// game is entered). A full set drops its longest-unseen entry.
+constexpr int MAX_LEARNED = 32;
+inline const void* learned[MAX_LEARNED] = {};
+inline int learned_seen[MAX_LEARNED] = {};  // frame_counter when last drawn in a zone
 inline int learned_count = 0;
-inline uint32_t last_floor = 0xFFFFFFFF;
 
 
 // A texture is learned only after this many consecutive frames in the
@@ -63,12 +70,57 @@ struct Candidate {
     int streak;
 };
 inline Candidate candidates[8] = {};
-inline int frame_counter = 0;
 
 inline void ResetLearned() {
     learned_count = 0;
     for (Candidate& c : candidates)
         c = {};
+}
+
+inline int LearnedIndex(const void* t) {
+    for (int i = 0; i < learned_count; i++)
+        if (learned[i] == t)
+            return i;
+    return -1;
+}
+
+inline bool Known(const void* t) {
+    return LearnedIndex(t) >= 0;
+}
+
+inline void RemoveLearned(int i) {
+    learned_count--;
+    learned[i] = learned[learned_count];
+    learned_seen[i] = learned_seen[learned_count];
+}
+
+inline void Learn(const void* t) {
+    if (learned_count == MAX_LEARNED) {
+        int oldest = 0;
+        for (int i = 1; i < learned_count; i++)
+            if (learned_seen[i] < learned_seen[oldest])
+                oldest = i;
+        diag::Log("trim: set full, dropped texture %p (unseen for %d passes)",
+                  learned[oldest], frame_counter - learned_seen[oldest]);
+        RemoveLearned(oldest);
+    }
+    learned[learned_count] = t;
+    learned_seen[learned_count] = frame_counter;
+    learned_count++;
+}
+
+// Called by CreateTexture with the wrapper it returns: if that pointer was
+// learned (or half-learned), it named a texture that is gone.
+inline void OnTextureCreated(const void* t) {
+    const int i = LearnedIndex(t);
+    if (i >= 0) {
+        RemoveLearned(i);
+        diag::Log("trim: forgot texture %p (its address now holds a new texture), %d left",
+                  t, learned_count);
+    }
+    for (Candidate& c : candidates)
+        if (c.tex == t)
+            c = {};
 }
 
 inline void OnFrame() {
@@ -77,10 +129,6 @@ inline void OnFrame() {
     frame_counter++;
     if (vrmod::config.trim_reset_pending) {
         vrmod::config.trim_reset_pending = false;
-        ResetLearned();
-    }
-    if (gamecam::anchor_floor != last_floor) {
-        last_floor = gamecam::anchor_floor;
         ResetLearned();
     }
     if (!vrmod::config.trim_head || !gamecam::written_this_frame)
@@ -139,13 +187,6 @@ inline void OnSetTexture(DWORD stage, const void* texture) {
     }
 }
 
-inline bool Known(const void* t) {
-    for (int i = 0; i < learned_count; i++)
-        if (learned[i] == t)
-            return true;
-    return false;
-}
-
 // Whether to hide the current world-space draw. Call sites must exclude
 // RHW draws first (this learns as a side effect).
 inline bool SuppressNow() {
@@ -156,7 +197,10 @@ inline bool SuppressNow() {
     }
     if (zone == 2) {
         // Always hidden here; learning needs a LEARN_STREAK.
-        if (current_texture != nullptr && learned_count < 16 && !Known(current_texture)) {
+        const int k = current_texture != nullptr ? LearnedIndex(current_texture) : -1;
+        if (k >= 0)
+            learned_seen[k] = frame_counter;
+        if (current_texture != nullptr && k < 0) {
             Candidate* slot = nullptr;
             for (Candidate& c : candidates)
                 if (c.tex == current_texture) { slot = &c; break; }
@@ -173,7 +217,8 @@ inline bool SuppressNow() {
                 slot->streak = (slot->last_frame >= frame_counter - 2) ? slot->streak + 1 : 1;
                 slot->last_frame = frame_counter;
                 if (slot->streak >= LEARN_STREAK) {
-                    learned[learned_count++] = current_texture;
+                    Learn(current_texture);
+                    *slot = {};
                     diag::Log("trim: learned texture %p at (%.1f, %.1f, %.1f), head (%.1f, %.1f, %.1f), %d total",
                               current_texture, last_world[0], last_world[1], last_world[2],
                               head[0], head[1], head[2], learned_count);
@@ -182,7 +227,10 @@ inline bool SuppressNow() {
         }
         return true;
     }
-    return current_texture != nullptr && Known(current_texture);
+    const int k = current_texture != nullptr ? LearnedIndex(current_texture) : -1;
+    if (k >= 0)
+        learned_seen[k] = frame_counter;
+    return k >= 0;
 }
 
 // True when the current world-space draw is the player body and

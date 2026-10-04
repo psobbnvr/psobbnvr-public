@@ -67,9 +67,12 @@ struct Config {
     // turns with the character (smoothed). 2 = fixed in the room along the
     // view's forward. Locked modes follow the head's position. OpenXR quad
     // layer only. With head_move 2, mode 1 follows the head's yaw through a
-    // dead zone instead (hud_follow_*, gamecam::HudGazeFollow).
+    // dead zone instead (hud_follow_*, gamecam::HudGazeFollow); while a
+    // menu is open the zone is hud_follow_menu_deg, so the eyes can roam
+    // over the menu without the HUD gliding away.
     int hud_lock = 1;
     float hud_follow_deg = 10.0f;
+    float hud_follow_menu_deg = 30.0f;
     float hud_follow_wait_s = 0.0f;
     float hud_follow_glide_s = 1.2f;
     // On-screen keyboard (psobbvr_vrkeyboard.hpp): a
@@ -172,6 +175,11 @@ struct Config {
     //   2 = on even without VR, head pose = identity (flat first-person
     //       debug view)
     int game_camera = 1;
+    // After a map change: 1 = the takeover drives the view through its
+    // ~0.4 s warm-up window (yaw snapping to the facing, under the arrival
+    // fade), 0 = nothing is written until the window ends (the game's own
+    // camera shows meanwhile). See gamecam::SETTLE_APPLIES.
+    bool warmup_drive = true;
     // Seated origin height above the character's feet, meters (the
     // entity's own head point is chest height). Fallback for while
     // eye_height_auto is off or has no measurement yet; meters for a
@@ -274,6 +282,19 @@ struct Config {
     // stereo::IsHiddenEffect); the game positions it from its own flare
     // state, so it drifts in VR. Flatscreen is unaffected.
     bool hide_sun = true;
+    // Whole-screen fades and tints (fading from black on arrival, the boss
+    // flashes): drawn over each whole eye image beneath the HUD layer on
+    // gameplay frames (stereo::IsScreenFill). 0 = skipped.
+    bool screen_fades = true;
+    // Cutscene bars (the letterbox over quest conversations) as a soft
+    // darkening of the top and bottom of the view, drawn into the eye
+    // images (stereo::DrawLetterboxShade): clear at letterbox_inner_deg
+    // above / below the line of sight, letterbox_strength x the bars' own
+    // fade at letterbox_outer_deg and beyond. 0 = the bars stay on the HUD.
+    bool letterbox = true;
+    float letterbox_inner_deg = 15.0f;
+    float letterbox_outer_deg = 45.0f;
+    float letterbox_strength = 1.0f;
     // First-person head trim (psobbvr_trim.hpp). trim_radius_m is the
     // learn zone (idle head content; the mag never comes closer than
     // 0.38 m); trim_wide_m is the coarse gate for learned-texture
@@ -386,6 +407,10 @@ struct Config {
     int cast_trace = 0;                      // developer build: per-tick lines left to log across casts
     bool swing_indicator_load_request = false;  // developer build: reload the indicator art
     bool palette_window_request = false;  // developer build: log the read next frame
+    // Light the hotkey bar slot a hotbar chord has readied for the swing
+    // (psobbvr_hotbarmark.hpp): gold and pulsing while it waits, a white
+    // flash when the swing fires it.
+    bool hotkey_highlight = true;
     // Developer-build one-shot: clears the pause bit on the player entity and
     // resets the hold state, in case a hold leaves the animation paused.
     // Consumed by controller::SwingWarp.
@@ -518,8 +543,8 @@ struct Config {
     // depth-tested, textured - Forest grass at site 0x802412, the CCA fog
     // cloud at 0x50891F) take the world route too, under the same depth
     // floor. Excluded: window-system callers and two fixed-depth HUD draws
-    // with the same blend (the screen fade 0x8047A4 and the equipped-weapon
-    // icon 0x81A29D).
+    // with the same blend (the radar's backing box 0x8047A4 and the
+    // equipped-weapon icon 0x81A29D).
     bool alpha_sprite_rule = true;
     // Alpha sprites' own near floor (view-depth units): between this and
     // sprite_near_floor they are still world sprites; closer, the draw is

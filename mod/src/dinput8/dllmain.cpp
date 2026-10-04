@@ -16,6 +16,7 @@
 #include "dinput8/dinput_proxy.h"
 #include "dinput8/overlay.h"
 #include "dinput8/registry_redirect.h"
+#include "psobbvr_settings.hpp"
 
 namespace {
 
@@ -183,16 +184,22 @@ uint32_t __fastcall HookedGameInitD3D(void* ecx_arg, void* edx_arg) {
     return ret;
 }
 
-// An integer from psobbvr.ini next to the game exe (def when unreadable).
+// psobbvr.ini next to the game exe; false when the path cannot be built.
+bool IniPath(char* path) {
+    DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    char* slash = strrchr(path, '\\');
+    if (slash == nullptr) return false;
+    *slash = '\0';
+    strcat_s(path, MAX_PATH, "\\psobbvr.ini");
+    return true;
+}
+
+// An integer setting: psobbvr.ini, else psobbvr-defaults.ini, else def.
 int IniInt(const char* section, const char* key, int def) {
     char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return def;
-    char* slash = strrchr(path, '\\');
-    if (slash == nullptr) return def;
-    *slash = '\0';
-    strcat_s(path, "\\psobbvr.ini");
-    return GetPrivateProfileIntA(section, key, def, path);
+    if (!IniPath(path)) return def;
+    return settings::GetInt(section, key, def, path);
 }
 
 // [registry] redirect=1 (default).
@@ -206,6 +213,14 @@ void Initialize() {
 #endif
     logging::Line("---- psobbvr dinput8 proxy loaded (build %s, compiled %s %s) ----",
                   PSOBBVR_GIT_REV, __DATE__, __TIME__);
+    // An older full psobbvr.ini becomes a player file before anything is
+    // read from it (psobbvr_settings.hpp).
+    char ini[MAX_PATH];
+    if (IniPath(ini)) {
+        const settings::TidyResult tidy = settings::Tidy(ini);
+        if (tidy.note[0] != '\0')
+            logging::Line("settings: %s", tidy.note);
+    }
     // Controller buttons while the window is unfocused (dinput_proxy.h).
     keyinject::unfocused_input = IniInt("vr", "unfocused_input", 1) != 0;
     logging::Line("dinput: unfocused_input=%d (synthetic keys served while the "

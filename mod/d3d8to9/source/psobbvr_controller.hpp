@@ -59,7 +59,10 @@ inline bool set_keys_resolved = false;
 // chord can form before the single-trigger action fires. In menus: right
 // = Enter, left = Backspace. The role is fixed at press time and held to
 // release, so a confirm that closes the menu does not turn the held
-// trigger into an attack.
+// trigger into an attack. The reverse: a field hold that a menu takes over
+// (the press talked to an NPC, or brought back the death prompt) goes
+// silent until release, since a held palette arrow would keep moving the
+// menu's cursor.
 //
 // The both-trigger chord forms only when the second trigger arrives while
 // the first is young (<= trig_pair_window_s); a trigger switch with a
@@ -74,6 +77,7 @@ inline bool set_keys_resolved = false;
 constexpr int TRIG_CHORD_SETTLE = 3;  // ~1.5 game ticks (~50 ms)
 inline bool prev_rtrig = false, rtrig_menu = false;
 inline bool prev_ltrig = false, ltrig_menu = false;
+inline bool rtrig_dropped = false, ltrig_dropped = false;  // field hold a menu took over
 inline int trig_settle = TRIG_CHORD_SETTLE;
 inline bool prev_rt_field = false, prev_lt_field = false;  // press edges
 inline LONGLONG rt_down_qpc = 0, lt_down_qpc = 0;  // field-press times
@@ -135,10 +139,21 @@ constexpr uintptr_t HUD_ROOT_CTRL_OFF = 0x54;        // + 4 * slot -> HUD contro
 constexpr uintptr_t HUD_CTRL_VTABLE = 0x00B3FA90;    // per-player HUD controller
 constexpr uintptr_t HUD_CTRL_PALETTE_OFF = 0x38;     // -> the three-button palette window
 constexpr uintptr_t PALETTE_WINDOW_VTABLE = 0x00B3F0E0;
+constexpr uintptr_t HUD_CTRL_HOTBAR_OFF = 0x3C;      // -> the ten-slot hotkey bar window
+constexpr uintptr_t HOTBAR_WINDOW_VTABLE = 0x00B3F0F0;
 constexpr uint16_t WINDOW_GATE_NOT_DRAWN = 0x10;    // u16 at window+8
 constexpr uint16_t WINDOW_GATE_UNREVEALED = 0x04;
 constexpr uintptr_t WINDOW_STATE_OFF = 0x2C;         // u32: bit 1 open, bit 2 sliding
+constexpr uint32_t WINDOW_STATE_OPEN = 0x1, WINDOW_STATE_SLIDING = 0x2;
+// The hotkey bar's own placement (its draw 0x710650 hands both to the
+// child-sprite setup 0x71B8D4): floats x, y at +0x40 (screen px, 640x480;
+// eased toward the target at +0x30 when the chat log raises the bar) and
+// the child scale x, y at +0x60 (0.6, set by the constructor 0x7104BC).
+constexpr uintptr_t WINDOW_POS_OFF = 0x40;
+constexpr uintptr_t HOTBAR_SCALE_OFF = 0x60;
 
+// A HUD window of the local player's HUD controller (the palette or the
+// hotkey bar).
 struct PaletteWindow {
     uintptr_t root = 0, ctrl = 0, win = 0;
     uint16_t gate = 0;   // window+8
@@ -147,7 +162,7 @@ struct PaletteWindow {
 };
 
 // False when the chain is missing (no HUD, controller or window yet).
-inline bool ReadPaletteWindow(PaletteWindow& p) {
+inline bool ReadHudWindow(uintptr_t ctrl_off, uintptr_t vtable, PaletteWindow& p) {
     p = PaletteWindow{};
     if (!diag::Accessible(HUD_ROOT_ADDR, 4, false) ||
         !diag::Accessible(HUD_LOCAL_SLOT_ADDR, 4, false))
@@ -165,14 +180,38 @@ inline bool ReadPaletteWindow(PaletteWindow& p) {
         *reinterpret_cast<const uintptr_t*>(ctrl) != HUD_CTRL_VTABLE)
         return false;
     p.ctrl = ctrl;
-    const uintptr_t win = *reinterpret_cast<const uintptr_t*>(ctrl + HUD_CTRL_PALETTE_OFF);
+    const uintptr_t win = *reinterpret_cast<const uintptr_t*>(ctrl + ctrl_off);
     if (win == 0 || !diag::Accessible(win, 0x30, false) ||
-        *reinterpret_cast<const uintptr_t*>(win) != PALETTE_WINDOW_VTABLE)
+        *reinterpret_cast<const uintptr_t*>(win) != vtable)
         return false;
     p.win = win;
     p.gate = *reinterpret_cast<const uint16_t*>(win + 8);
     p.state = *reinterpret_cast<const uint32_t*>(win + WINDOW_STATE_OFF);
     p.visible = (p.gate & (WINDOW_GATE_NOT_DRAWN | WINDOW_GATE_UNREVEALED)) == 0;
+    return true;
+}
+
+inline bool ReadPaletteWindow(PaletteWindow& p) {
+    return ReadHudWindow(HUD_CTRL_PALETTE_OFF, PALETTE_WINDOW_VTABLE, p);
+}
+
+// The hotkey bar, with its placement; false when it is missing.
+struct HotbarWindow {
+    PaletteWindow w;
+    float x = 0.0f, y = 0.0f;           // window+0x40
+    float scale_x = 0.0f, scale_y = 0.0f;  // window+0x60
+};
+inline bool ReadHotbarWindow(HotbarWindow& h) {
+    h = HotbarWindow{};
+    if (!ReadHudWindow(HUD_CTRL_HOTBAR_OFF, HOTBAR_WINDOW_VTABLE, h.w) ||
+        !diag::Accessible(h.w.win, HOTBAR_SCALE_OFF + 8, false))
+        return false;
+    const float* pos = reinterpret_cast<const float*>(h.w.win + WINDOW_POS_OFF);
+    const float* scale = reinterpret_cast<const float*>(h.w.win + HOTBAR_SCALE_OFF);
+    h.x = pos[0];
+    h.y = pos[1];
+    h.scale_x = scale[0];
+    h.scale_y = scale[1];
     return true;
 }
 
@@ -1217,6 +1256,12 @@ inline bool ArrowTechLeftCasts(BYTE arrow, bool ctrl_swap) {
 inline BYTE ctx_direct_key = 0;
 // Combat-free-area state last frame (logged on change).
 inline bool sw_combatfree_prev = false;
+// Entity HP words, as the game's own HP routines read them (get HP
+// 0x775270, Heal 0x7773D4: signed current HP at +0x334, max at +0x2BC).
+constexpr uintptr_t ENTITY_HP_OFFSET = 0x334;
+constexpr uintptr_t ENTITY_MAX_HP_OFFSET = 0x2BC;
+// Player-down state last frame (logged on change).
+inline bool sw_dead_prev = false;
 
 // Hotkey-bar arming ([vr] hotkey_arm): the hotkey armed for the swing,
 // its arm time, and the last swing fire consumed. The mode flags are
@@ -1227,6 +1272,10 @@ inline bool hk_armed_left = false; // its technique casts on a left swing too
 inline LONGLONG hk_armed_qpc = 0;
 inline LONGLONG hk_seen_fire_qpc = 0;
 inline bool hk_swing_mode = false, hk_cast_mode = false, hk_menu_mode = false;
+// The last hotkey a swing fired, and the game tick it fired on (the
+// readied-hotkey highlight's flash).
+inline BYTE hk_fired_key = 0;
+inline unsigned long hk_fired_tick = 0;
 
 // bindings::hotkey_press: at the chord's press edge, decide whether this
 // hotkey arms (tech slot, melee normal attack) or presses through.
@@ -1316,6 +1365,7 @@ inline void OnFrame(bool gameplay_drives) {
         bindings::Reset();
         hk_armed_key = 0;
         prev_rtrig = prev_ltrig = false;
+        rtrig_dropped = ltrig_dropped = false;
         prev_rt_field = prev_lt_field = false;
         rt_spent = lt_spent = false;
         trig_active = 0;
@@ -1368,13 +1418,32 @@ inline void OnFrame(bool gameplay_drives) {
                               : "combat area - arming live",
                   sw_floor);
     }
+    // A dead player (HP 0) presses direct too: after the "return to
+    // Pioneer 2?" box is dismissed, the attack button brings it back, and
+    // an armed press would wait for a swing.
+    bool sw_dead = false;
+    if (sw_entity != 0 &&
+        diag::Accessible(sw_entity + ENTITY_MAX_HP_OFFSET, 2, false) &&
+        diag::Accessible(sw_entity + ENTITY_HP_OFFSET, 2, false)) {
+        const int16_t max_hp = *reinterpret_cast<const int16_t*>(
+            sw_entity + ENTITY_MAX_HP_OFFSET);
+        const int16_t hp = *reinterpret_cast<const int16_t*>(
+            sw_entity + ENTITY_HP_OFFSET);
+        sw_dead = max_hp > 0 && hp <= 0;
+    }
+    if (sw_dead != sw_dead_prev) {
+        sw_dead_prev = sw_dead;
+        diag::Log("swingattack: %s",
+                  sw_dead ? "player down (HP 0) - chords press direct"
+                          : "player up - arming live");
+    }
     const bool swing_mode = vrmod::config.swing_attack != 0 &&
-                            gameplay_drives && !combat_free &&
+                            gameplay_drives && !combat_free && !sw_dead &&
                             weapongrip::SwingWeapon();
     // Tech chords arm with any weapon, so the detector also samples
     // whenever cast arming could apply. Independent of swing_attack.
     const bool cast_swing_mode = vrmod::config.cast_swing &&
-                                 gameplay_drives && !combat_free;
+                                 gameplay_drives && !combat_free && !sw_dead;
     SwingSample(1, cs, swing_mode || cast_swing_mode);
     // The left hand samples with a twin weapon, and under cast arming
     // when it may cast (sw_armed_tech_left).
@@ -1421,9 +1490,12 @@ inline void OnFrame(bool gameplay_drives) {
         now[bindcore::BTN_RIGHT_STICK_CLICK] = cs.stick_click[1];
         now[bindcore::BTN_LEFT_MENU] = cs.menu[0];
         now[bindcore::BTN_RIGHT_MENU] = cs.menu[1];
-        bindings::StickFlick(cs.stick_x[1], cs.stick_y[1], !menu_mode, now);
         held_mods = (now[bindcore::BTN_LEFT_GRIP] ? bindcore::MOD_LEFT_GRIP : 0u) |
                     (now[bindcore::BTN_RIGHT_GRIP] ? bindcore::MOD_RIGHT_GRIP : 0u);
+        // In a menu the stick navigates, unless a flick chord's grip is
+        // held: then it picks hotkeys as in the field.
+        bindings::StickFlick(cs.stick_x[1], cs.stick_y[1],
+                             !menu_mode || bindings::StickIsSelector(held_mods), now);
         bindings::Evaluate(now, held_mods, menu_mode, add);
     }
 
@@ -1440,8 +1512,20 @@ inline void OnFrame(bool gameplay_drives) {
         add(K_ENTER);                      // menu confirm
     if (ltrig_now && ltrig_menu)
         add(K_BACKSPACE);                  // menu back
-    const bool rt_field = rtrig_now && !rtrig_menu;
-    const bool lt_field = ltrig_now && !ltrig_menu;
+    if (!rtrig_now)
+        rtrig_dropped = false;
+    else if (!rtrig_menu && menu_mode && !rtrig_dropped) {
+        rtrig_dropped = true;
+        diag::Log("trigger: right field hold silenced (a menu took focus)");
+    }
+    if (!ltrig_now)
+        ltrig_dropped = false;
+    else if (!ltrig_menu && menu_mode && !ltrig_dropped) {
+        ltrig_dropped = true;
+        diag::Log("trigger: left field hold silenced (a menu took focus)");
+    }
+    const bool rt_field = rtrig_now && !rtrig_menu && !rtrig_dropped;
+    const bool lt_field = ltrig_now && !ltrig_menu && !ltrig_dropped;
     if (trig_qpf == 0) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
@@ -1582,6 +1666,8 @@ inline void OnFrame(bool gameplay_drives) {
     if (hk_armed_key != 0 && sw_fire_key == hk_armed_key &&
         sw_fire_qpc != hk_seen_fire_qpc) {
         hk_seen_fire_qpc = sw_fire_qpc;  // the swing fired it
+        hk_fired_key = hk_armed_key;
+        hk_fired_tick = GameTicks();
         hk_armed_key = 0;
     }
     if (menu_mode || !gameplay_drives)
@@ -1616,7 +1702,8 @@ inline void OnFrame(bool gameplay_drives) {
     // Sticks. The left stick always walks. The right stick turns in the
     // field, but not while a menu owns it (Left/Right Arrow there; Up/Down
     // on the dominant axis past a firm threshold) or while a hotkey-flick
-    // grip is held (psobbvr_bindings.hpp).
+    // grip is held (psobbvr_bindings.hpp) - in a menu that grip, or a
+    // flick not yet re-centered, also stops the arrows.
     const float lx = DeadzoneCurve(cs.stick_x[0], dz);
     const float ly = DeadzoneCurve(cs.stick_y[0], dz);
     // With the Quick Menu up (our own latch), X stays the turn; its
@@ -1627,7 +1714,8 @@ inline void OnFrame(bool gameplay_drives) {
     const float rx = turn_ok ? DeadzoneCurve(cs.stick_x[1], dz) : 0.0f;
     const float rxr = cs.stick_x[1];
     const float ry = cs.stick_y[1];
-    if (menu_mode) {
+    if (menu_mode && !bindings::StickIsSelector(held_mods) &&
+        !bindings::FlickOwnsStick()) {
         if (fabsf(ry) >= 0.6f && fabsf(ry) > fabsf(rxr))
             add(ry > 0 ? K_UP : K_DOWN);
         else if (!quick_menu && fabsf(rxr) >= 0.6f && fabsf(rxr) > fabsf(ry))

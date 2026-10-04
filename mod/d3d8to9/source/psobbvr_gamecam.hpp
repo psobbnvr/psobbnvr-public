@@ -58,9 +58,12 @@ constexpr uintptr_t CAMERA_UPDATE_ORIGINAL = 0x004D386C;
 // The update's third sub-call (0x004D3EF4) is not hooked: the renderer
 // doesn't use the game's derived camera state, only audio and culling do.
 
-// After a map change the takeover waits for this many consecutive good
-// Apply() calls (twice per frame, ~0.4 s) so the game's spawn placement
-// has landed (the floor id can flip a few frames before position/facing).
+// The warm-up window after a map change: this many consecutive good Apply()
+// calls (twice per frame, ~0.4 s), long enough for the game's spawn
+// placement to land (the floor id can flip a few frames before
+// position/facing). With [vr] warmup_drive the view is driven through the
+// window and its yaw snaps to the live facing, so a late facing write lands
+// at once under the arrival fade; with 0 nothing is written until it ends.
 constexpr int SETTLE_APPLIES = 24;
 
 // The game's view matrix slot (filled by 0x0082F130, then
@@ -119,7 +122,9 @@ inline bool hud_reseed = true;
 
 // The dead-zoned gaze follow: the HUD rests until the head has stayed more
 // than hud_follow_deg from it for hud_follow_wait_s, then glides back in
-// front of the head on a critically damped spring and rests again.
+// front of the head on a critically damped spring and rests again. While
+// a menu is open the zone is hud_follow_menu_deg, so reading across a
+// menu does not start a glide; a glide already running still finishes.
 inline bool hud_gaze_gliding = false;
 inline float hud_gaze_away_s = 0.0f;  // time the head has spent outside
 inline float hud_gaze_vel = 0.0f;     // glide speed, radians per second
@@ -151,15 +156,18 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
     // Signed angle that turns the HUD's direction onto the head's.
     const float gap = atan2f(hud_fx * hz - hud_fz * hx, hud_fx * hx + hud_fz * hz);
     if (!hud_gaze_gliding) {
-        if (fabsf(gap) <= vrmod::config.hud_follow_deg * (3.14159265f / 180.0f)) {
+        const bool menu = diag::ui_focused;
+        const float zone_deg =
+            menu ? vrmod::config.hud_follow_menu_deg : vrmod::config.hud_follow_deg;
+        if (fabsf(gap) <= zone_deg * (3.14159265f / 180.0f)) {
             hud_gaze_away_s = 0.0f;
             return;
         }
         hud_gaze_away_s += dt;
         if (hud_gaze_away_s < vrmod::config.hud_follow_wait_s)
             return;
-        diag::Log("hudfollow: head %+.0f deg off the HUD for %.2f s, gliding",
-                  gap * 57.2958f, hud_gaze_away_s);
+        diag::Log("hudfollow: head %+.0f deg off the HUD for %.2f s, gliding (%s zone %.0f)",
+                  gap * 57.2958f, hud_gaze_away_s, menu ? "menu" : "field", zone_deg);
         hud_gaze_gliding = true;
         hud_gaze_away_s = 0.0f;
         hud_gaze_vel = 0.0f;
@@ -251,6 +259,15 @@ inline uintptr_t anchor_camera_obj = 0;
 inline uintptr_t anchor_entity = 0;
 inline uint32_t anchor_floor = 0xFFFFFFFF;
 inline int settle_counter = 0;
+// Placement at the window's first call, for the log line at its end (how
+// far the game moved the character after the floor id flipped).
+inline int32_t warmup_first_facing = 0;
+inline float warmup_first_feet[3] = {};
+
+// Set by the renderer at each frame end: the burst tunnel (lobby <-> game)
+// holds the screen. The new player entity is readable before the tunnel
+// ends, so the warm-up must not drive the view over it.
+inline bool tunnel_latched = false;
 
 inline bool Enabled() {
     switch (vrmod::config.game_camera) {
@@ -396,7 +413,12 @@ inline void Apply() {
     const uintptr_t entity = ResolveEntity();
     const float* feet = entity != 0
         ? reinterpret_cast<const float*>(entity + ENTITY_POS_OFFSET) : nullptr;
-    if (cam == nullptr || feet == nullptr) {
+    // Feet that are not finite or absurdly far out are a half-built entity.
+    const bool feet_sane = feet != nullptr &&
+                           std::isfinite(feet[0]) && std::isfinite(feet[1]) &&
+                           std::isfinite(feet[2]) && fabsf(feet[0]) < 1e5f &&
+                           fabsf(feet[1]) < 1e5f && fabsf(feet[2]) < 1e5f;
+    if (cam == nullptr || !feet_sane) {
         settle_counter = 0;  // transition in progress - restart the warm-up
         eyeheight::OnAnchorReset();  // same stale-ring rule as the menu gap
         return;
@@ -426,13 +448,29 @@ inline void Apply() {
         vrmod::config.recenter_request = false;
         want_recenter = true;
     }
-    if (settle_counter < SETTLE_APPLIES) {
+    const bool warming = settle_counter < SETTLE_APPLIES;
+    if (warming) {
         settle_counter++;
-        // Settle done: the character has stood idle since the spawn, so
-        // capture its standing head height.
-        if (settle_counter == SETTLE_APPLIES)
+        const int32_t facing_now =
+            *reinterpret_cast<const int32_t*>(entity + ENTITY_FACING_OFFSET);
+        if (settle_counter == 1) {
+            warmup_first_facing = facing_now;
+            memcpy(warmup_first_feet, feet, sizeof(warmup_first_feet));
+        }
+        if (settle_counter == SETTLE_APPLIES) {
+            // Window over: the character has stood idle since the spawn,
+            // so capture its standing head height.
             eyeheight::CaptureStanding("settle");
-        return;
+            const float dx = feet[0] - warmup_first_feet[0];
+            const float dy = feet[1] - warmup_first_feet[1];
+            const float dz = feet[2] - warmup_first_feet[2];
+            diag::Log("gamecam: warm-up done, facing moved %+.1f deg, feet moved %.2f units",
+                      static_cast<int16_t>(static_cast<uint32_t>(facing_now - warmup_first_facing)) *
+                          (360.0f / 65536.0f),
+                      sqrtf(dx * dx + dy * dy + dz * dz));
+        }
+        if (!vrmod::config.warmup_drive || tunnel_latched)
+            return;
     }
 
     D3DMATRIX head = vrmod::Identity();
@@ -478,10 +516,17 @@ inline void Apply() {
         hud_reseed = true;
         anchor_valid = true;
         want_recenter = false;
-        diag::Log("gamecam: anchor facing=%d (theta %.1f deg) fwd=(%.3f,%.3f) headyaw=(%.3f,%.3f) feet=(%.1f,%.1f,%.1f)",
+        diag::Log("gamecam: anchor facing=%d (theta %.1f deg) fwd=(%.3f,%.3f) headyaw=(%.3f,%.3f) feet=(%.1f,%.1f,%.1f)%s",
                   facing_bams, theta * 57.2958f,
                   anchor_dx, anchor_dz, anchor_hx, anchor_hz,
-                  feet[0], feet[1], feet[2]);
+                  feet[0], feet[1], feet[2], warming ? " (warm-up: driving)" : "");
+    }
+    if (warming) {
+        // The placement may still land: no run-lean ramp or attack hold
+        // from it, and the HUD snaps with the view.
+        prev_feet_valid = false;
+        hold_prev_valid = false;
+        hud_reseed = true;
     }
 
     // Current character facing (used by yaw-follow and the run lean).
@@ -546,8 +591,13 @@ inline void Apply() {
             target_fx = sinf(t_theta);
             target_fz = cosf(t_theta);
         }
-        follow_dx += (target_fx - follow_dx) * FOLLOW_ALPHA;
-        follow_dz += (target_fz - follow_dz) * FOLLOW_ALPHA;
+        if (warming) {  // snap: a late placement turn lands at once
+            follow_dx = target_fx;
+            follow_dz = target_fz;
+        } else {
+            follow_dx += (target_fx - follow_dx) * FOLLOW_ALPHA;
+            follow_dz += (target_fz - follow_dz) * FOLLOW_ALPHA;
+        }
         const float norm = sqrtf(follow_dx * follow_dx + follow_dz * follow_dz);
         if (norm > 0.05f) {
             follow_dx /= norm;

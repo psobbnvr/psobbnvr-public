@@ -2,6 +2,16 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.3.0-beta (2026-10-04)
+
+- Fixed hotkeys 5-8 (left grip + right stick flick) not being assignable in the Customize menu.
+- After dying, the right trigger brings back the "return to Pioneer 2?" prompt after it has been dismissed.
+- Added indicator for selected hotbar entry.
+- Improved psobbvr.ini handling so that settings persist through mod updates.
+- Increased deadzone for UI movement when menus are detected (head locomotion on, HUD in front of character).
+- Fixed various full-screen effects that were previously only happening in the HUD space (teleport fade, letterbox bars, death screen).
+- Improved character load-in behavior.
+
 ## 0.2.0-beta (2026-10-03)
 
 - Added "HUD Height" Option in psobbvr_options.exe (VR settings tab). Decrease value to lower HUD.

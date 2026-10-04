@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <share.h>
 #include <windows.h>
+#include "psobbvr_settings.hpp"
 
 namespace diag {
 
@@ -27,7 +28,7 @@ inline void OpenLog() {
     if (slash != nullptr) {
         slash[1] = '\0';
         strcat_s(ini, "psobbvr.ini");
-        enabled = GetPrivateProfileIntA("debug", "enabled", 1, ini) != 0;
+        enabled = settings::GetInt("debug", "enabled", 1, ini) != 0;
     }
     if (!enabled)
         return;
@@ -114,6 +115,8 @@ inline bool bindings_reload = false;
 inline unsigned bodycull_applied = 0;
 inline int menutrace_frames = 0;
 inline bool menutrace_full = false;
+// The controller's menu mode this frame (a menu, prompt or non-gameplay
+// screen has the input); the menu trace and the HUD follow read it.
 inline bool ui_focused = false;
 inline unsigned menutrace_frame = 0;
 inline int menutrace_draw = 0;

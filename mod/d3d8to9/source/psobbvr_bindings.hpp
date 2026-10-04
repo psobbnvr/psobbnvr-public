@@ -1,8 +1,9 @@
 #pragma once
 
-// The in-game side of the binding table: loads psobbvr.ini [bindings] over
-// the defaults (psobbvr_bindings_core.hpp), reloads when the file changes
-// (checked about once a second), and turns each frame's buttons into keys
+// The in-game side of the binding table: loads the [bindings] lines of
+// psobbvr.ini and psobbvr-defaults.ini (psobbvr_settings.hpp) over the
+// built-in defaults (psobbvr_bindings_core.hpp), reloads when psobbvr.ini
+// changes (checked about once a second), and turns each frame's buttons into keys
 // for psobbvr_controller.hpp.
 //
 // The chord is decided at the button's press edge: a grip already down
@@ -10,9 +11,9 @@
 // nothing. Hold actions keep their keys down until release; one-shot
 // actions (Tab, hotkeys) press for kOneShotFrames even if released sooner
 // (the game needs a full tick). Right-stick flicks are derived buttons -
-// a firm push in one direction presses, near center releases - in the
-// field only, and only with a modifier held (StickIsSelector suppresses
-// the turn then).
+// a firm push in one direction presses, near center releases - only with a
+// modifier held (StickIsSelector suppresses the turn, and in menus the
+// arrow keys, then).
 
 #include <share.h>
 #include <windows.h>
@@ -40,6 +41,7 @@ inline int latched[bindcore::BTN_COUNT] = {-1, -1, -1, -1, -1, -1, -1,
 inline int shot_frames[bindcore::BTN_COUNT] = {};
 inline int shot_binding[bindcore::BTN_COUNT] = {};
 inline int flick_dir = -1;                     // latched BTN_RSTICK_* or -1
+inline bool flick_live = false;                // the latched push may press a flick button
 inline bool ctrl_held = false;                 // a hold binding emitted Ctrl this frame
 // Hotkey press hook (psobbvr_controller.hpp): called at a hotkey chord's
 // press edge; returning true consumes the press (armed for the swing).
@@ -65,6 +67,7 @@ inline void Reset() {
         shot_binding[i] = -1;
     }
     flick_dir = -1;
+    flick_live = false;
     ctrl_held = false;
 }
 
@@ -93,8 +96,9 @@ inline void Dump() {
     }
 }
 
-// (Re)load the section. A present but unreadable ini (mid-rewrite, locked)
-// keeps the previous table; a missing ini or section means the defaults.
+// (Re)load the section. A present but unreadable psobbvr.ini (mid-rewrite,
+// locked) keeps the previous table; missing files or sections mean the
+// built-in defaults.
 inline void Load(const char* why) {
     if (ini_path[0] == '\0') {
         if (!GetCurrentDirectoryA(MAX_PATH, ini_path))
@@ -118,9 +122,9 @@ inline void Load(const char* why) {
             fclose(f);
         }
     }
-    // GetPrivateProfileSection returns "k=v\0k=v\0\0" (0 = no section).
+    // "k=v\0k=v\0\0", psobbvr.ini's lines first (0 = no lines in either file).
     static char buf[16384];
-    const DWORD n = GetPrivateProfileSectionA("bindings", buf, sizeof(buf), ini_path);
+    const DWORD n = settings::GetSection("bindings", buf, sizeof(buf), ini_path);
     const char* lines[128];
     int nlines = 0;
     for (const char* p = buf; n > 0 && *p != '\0' && nlines < 128;
@@ -154,23 +158,33 @@ inline void Poll() {
     }
 }
 
-// Derive the flick buttons from the right stick (raw axes). Field only:
-// in menu mode the stick is Up/Down/Left/Right navigation.
-inline void StickFlick(float x, float y, bool field, bool now[bindcore::BTN_COUNT]) {
+// Derive the flick buttons from the right stick (raw axes). A firm push
+// latches a direction until the stick re-centers; it presses a flick
+// button only if the stick was live when it latched - always in the field,
+// and in a menu while a flick chord's grip is held (the Customize menu
+// assigns a hotkey slot by its number key). Otherwise the stick is menu
+// navigation, and a push already under way when the grip goes down is not
+// a flick, as in the field (grip first, then flick).
+inline void StickFlick(float x, float y, bool live, bool now[bindcore::BTN_COUNT]) {
     const float ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
     const float mag = ax > ay ? ax : ay;
-    if (!field) {
-        flick_dir = -1;
-    } else if (flick_dir < 0) {
-        if (mag >= STICK_FIRM)
+    if (flick_dir < 0) {
+        if (mag >= STICK_FIRM) {
             flick_dir = ay >= ax ? (y > 0 ? bindcore::BTN_RSTICK_UP : bindcore::BTN_RSTICK_DOWN)
                                  : (x > 0 ? bindcore::BTN_RSTICK_RIGHT : bindcore::BTN_RSTICK_LEFT);
+            flick_live = live;
+        }
     } else if (mag < STICK_CENTER) {
         flick_dir = -1;
     }
     for (int b = bindcore::BTN_RSTICK_UP; b <= bindcore::BTN_RSTICK_RIGHT; b++)
-        now[b] = flick_dir == b;
+        now[b] = flick_live && flick_dir == b;
 }
+
+// Does a live push hold the stick? It does until the stick re-centers,
+// even if the grip lets go first, so the push never turns into a menu
+// arrow press.
+inline bool FlickOwnsStick() { return flick_dir >= 0 && flick_live; }
 
 // Is a chord bound to this action held (its button down since the press
 // that picked it)? Hotkey arming lives only while this is true.

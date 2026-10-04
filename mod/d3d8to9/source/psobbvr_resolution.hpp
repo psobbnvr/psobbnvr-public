@@ -7,7 +7,8 @@
 // screen-space (RHW) vertices of its UI (all DrawPrimitiveUP with XYZRHW)
 // are scaled; 3D geometry scales through the projection.
 //
-// psobbvr.ini in the current directory (the game folder):
+// psobbvr.ini in the current directory (the game folder), over
+// psobbvr-defaults.ini (psobbvr_settings.hpp):
 //   [render]
 //   width=2880
 //   height=2160
@@ -18,6 +19,7 @@
 #include <vector>
 #include <windows.h>
 #include <d3d9.h>
+#include "psobbvr_settings.hpp"
 
 namespace resolution {
 
@@ -50,8 +52,8 @@ inline void LoadConfig() {
     if (!GetCurrentDirectoryA(MAX_PATH, path))
         return;
     strcat_s(path, "\\psobbvr.ini");
-    const UINT w = GetPrivateProfileIntA("render", "width", 2880, path);
-    const UINT h = GetPrivateProfileIntA("render", "height", 2160, path);
+    const UINT w = settings::GetInt("render", "width", 2880, path);
+    const UINT h = settings::GetInt("render", "height", 2160, path);
     if (w >= 640 && h >= 480 && w <= 16384 && h <= 16384 && !(w == 640 && h == 480)) {
         target_width = w;
         target_height = h;

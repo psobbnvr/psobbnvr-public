@@ -76,8 +76,9 @@ Other controllers (Index, Pico) get SteamVR's automatic mapping from the Quest l
 
 1. Download the latest zip from
    [Releases](../../releases). It contains eight files: `d3d8.dll`,
-   `dinput8.dll`, `openvr_api.dll`, `openxr_loader.dll`, `psobbvr.ini`,
-   `psobbvr_options.exe`, `LICENSE` and `THIRD-PARTY-NOTICES.txt`.
+   `dinput8.dll`, `openvr_api.dll`, `openxr_loader.dll`,
+   `psobbvr-defaults.ini`, `psobbvr_options.exe`, `LICENSE` and
+   `THIRD-PARTY-NOTICES.txt`.
 2. Unzip all of them into your game folder, next to `psobb.exe`. If the
    folder already has a `d3d8.dll` or `dinput8.dll` (a graphics or
    widescreen patch), back it up first: the mod's files replace them.
@@ -88,11 +89,12 @@ The monitor shows a wide side-by-side mirror of both eyes; the headset
 shows the game. If VR cannot start, a message box says why and the game
 closes when you press OK (see [Troubleshooting](#troubleshooting)).
 
-**Updating:** unzip the new release over the old one. The zip replaces
-`psobbvr.ini`, so if you changed your controller bindings, use **Export
-bindings...** in the Options program (`psobbvr_options.exe`) first and **Import bindings...**
-afterwards.  Make note of your VR Settings tab as well since there is no
-import/export function (as parameters here can be added/removed during releases).
+**Updating:** unzip the new release over the old one. Your settings and
+bindings are kept in `psobbvr.ini`, which no release contains, so they
+survive the update; anything you never changed takes the new release's
+default from `psobbvr-defaults.ini`. The first launch after updating
+from 0.2.0-beta or older trims your old `psobbvr.ini` down to the
+settings you changed (the old file is kept as `psobbvr.ini.bak`).
 
 ## Playing on PSOBB.io
 
@@ -148,7 +150,9 @@ game menu or dialog is showing.
 
 Chords are decided the moment the button goes down: hold the grip
 **first**, then press the button. Hotkeys do not fire while the right
-grip is held.
+grip is held. A technique or attack on the hotkey bar is readied by its
+chord and fires on your next swing while the chord is held; its slot on
+the bar lights up gold while it waits.
 
 **Fighting.** Guns are aimed with your right hand. With a melee weapon, the
 trigger arms the attack and swinging your hand performs it; with
@@ -171,9 +175,11 @@ Options program and that action fires on the button press instead.
 
 **Walking.** A forward push walks the way your character faces; turn
 with the right stick. Tick "Head-based locomotion" in the Options
-program to walk where you look instead. If you do, set "HUD position" to
-"Follows your head" too: the HUD's position only updates 30 times a
-second, so when it moves with your body it judders.
+program to walk where you look instead; your character turns to follow.
+With the default HUD position ("In front of your character"), the HUD
+then follows your head: it stays put while you glance around and glides
+back in front of you once you look further away. With a menu open it
+waits until you look well away, so you can read across the menu.
 
 **Typing.** Whenever the game opens a text field (chat, login, character
 name), a keyboard panel appears in front of you with a beam from each
@@ -207,9 +213,9 @@ three pages:
 
 - **Controller bindings:** one entry per action; type or pick a chord
   (`left_grip+x`, `menu`, `right_stick_click`, ...). **Check** explains
-  anything it would reject; **Save** writes `psobbvr.ini`, and a running
-  game picks it up within a second. **Export** / **Import** save and
-  load your layout.
+  anything it would reject; **Save** writes your changes to
+  `psobbvr.ini`, and a running game picks them up within a second.
+  **Export** / **Import** save and load your layout.
 - **Game options:** what the original game's `option.exe` set: graphics
   detail, fog, music and sound effects, "save ID and password". The mod
   keeps these in its own registry key (`HKEY_CURRENT_USER\Software\psobbvr\PSOBB`),
@@ -225,8 +231,11 @@ three pages:
   setting to read what it does.
 
 Game options and VR settings take effect the next time the game starts.
-Everything else, with a comment explaining each setting, is in
-`psobbvr.ini`.
+Every setting, with a comment explaining it and its default value, is
+in `psobbvr-defaults.ini`. Don't edit that file (each release replaces
+it): to change a setting the Options program doesn't show, copy its
+line into `psobbvr.ini` under the same `[section]`, creating the file if
+there is none. `psobbvr.ini` holds only your changes.
 
 Which physical button counts as "A" or "grip" is decided by SteamVR's
 own binding page: SteamVR → Settings → Controllers → Manage controller
@@ -272,9 +281,10 @@ For menu problems, a screenshot of the monitor mirror helps most.
 ## Uninstall
 
 Delete the mod's files from the game folder (`d3d8.dll`, `dinput8.dll`,
-`openvr_api.dll`, `openxr_loader.dll`, `psobbvr.ini`,
-`psobbvr_options.exe`, and the `psobbvr-*.log` files) and put back any
-`d3d8.dll` / `dinput8.dll` you backed up (on PSOBB.io: its own
+`openvr_api.dll`, `openxr_loader.dll`, `psobbvr-defaults.ini`,
+`psobbvr.ini`, `psobbvr.ini.bak`, `psobbvr_options.exe`, and the
+`psobbvr-*.log` files) and put back any `d3d8.dll` / `dinput8.dll` you
+backed up (on PSOBB.io: its own
 `d3d8.dll`). To remove the mod's settings too, delete the registry key
 `HKEY_CURRENT_USER\Software\psobbvr`.
 
@@ -318,7 +328,7 @@ configure step stops on anything else. The results are
 and `mod/build/Release/psobbvr_options.exe`. Copy them into the game
 folder together with `mod/third_party/openvr/bin/win32/openvr_api.dll`,
 `mod/third_party/openxr_sdk/bin/win32/openxr_loader.dll` and
-`client/psobbvr.ini`. The two DLLs always go in as a pair.
+`client/psobbvr-defaults.ini`. The two DLLs always go in as a pair.
 
 The logs open with the git revision the build was configured from, so
 re-run the configure step after pulling.

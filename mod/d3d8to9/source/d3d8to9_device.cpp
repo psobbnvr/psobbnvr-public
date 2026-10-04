@@ -15,6 +15,7 @@
 #include "psobbvr_textsnap.hpp"
 #include "psobbvr_controller.hpp"
 #include "psobbvr_swingind.hpp"
+#include "psobbvr_hotbarmark.hpp"
 #include "psobbvr_objvis.hpp"
 #include "psobbvr_trail.hpp"
 #include "psobbvr_particlepool.hpp"
@@ -64,10 +65,11 @@ Direct3DDevice8::Direct3DDevice8(Direct3D8 *d3d, IDirect3DDevice9 *ProxyInterfac
 Direct3DDevice8::~Direct3DDevice8()
 {
 	// psobbvr: drop the stereo eye targets if they belong to this device,
-	// and the swing indicator's textures (reloaded on the next draw).
+	// and the HUD sprites' textures (reloaded on the next draw).
 	if (stereo::device == ProxyInterface)
 		stereo::ReleaseTargets();
 	swingind::ReleaseAssets();
+	hotbarmark::ReleaseAssets();
 
 	delete ProxyAddressLookupTable;
 }
@@ -247,10 +249,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 	resolution::OverridePresentParameters(PresentParams);
 	stereo::OverridePresentParameters(PresentParams);
 
-	// psobbvr: the stereo eye targets and the swing indicator's assets live
-	// in D3DPOOL_DEFAULT and would make Reset fail; they are recreated lazily.
+	// psobbvr: the stereo eye targets and the HUD sprites' assets live in
+	// D3DPOOL_DEFAULT and would make Reset fail; they are recreated lazily.
 	stereo::ReleaseTargets();
 	swingind::ReleaseAssets();
+	hotbarmark::ReleaseAssets();
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
 
@@ -279,10 +282,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	stereo::FinishFrame();
 
 
-	// psobbvr: draw the swing-timing indicator over the game's HUD
-	// (psobbvr_swingind.hpp), then submit the eye textures to the headset
+	// psobbvr: draw the swing-timing indicator and the readied-hotkey
+	// highlight over the game's HUD (psobbvr_swingind.hpp,
+	// psobbvr_hotbarmark.hpp), then submit the eye textures to the headset
 	// and wait for the next frame's head pose (no-op unless VR is running).
 	swingind::Draw(ProxyInterface);
+	hotbarmark::Draw(ProxyInterface);
 	stereo::VrEndOfFrame();
 
 	// psobbvr: camera takeover, second write with the fresh pose: the
@@ -346,6 +351,7 @@ HRESULT Direct3DDevice8::HandlePresentResult(HRESULT hr)
 		CurrentZBiasRenderState = 0;
 		stereo::ReleaseTargets();
 		swingind::ReleaseAssets();
+		hotbarmark::ReleaseAssets();
 
 		D3DPRESENT_PARAMETERS PresentParams = LastPresentParams;
 		HRESULT reset;
@@ -446,6 +452,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CreateTexture(UINT Width, UINT Height
 		return hr;
 
 	*ppTexture = ProxyAddressLookupTable->FindAddress<Direct3DTexture8>(TextureInterface);
+	// psobbvr: a reused D3D9 address hands back the old wrapper, so the head
+	// trim forgets this pointer if it had learned it (psobbvr_trim.hpp).
+	trim::OnTextureCreated(static_cast<IDirect3DBaseTexture8 *>(*ppTexture));
 
 	return D3D_OK;
 }
@@ -941,6 +950,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: swing-timing indicator state (psobbvr_swingind.hpp) - after
 	// the controller, whose swing and hold state it reads.
 	swingind::Update(gamecam::Enabled() && gamecam::DrivesView());
+	// psobbvr: readied-hotkey highlight state (psobbvr_hotbarmark.hpp).
+	hotbarmark::Update(gamecam::Enabled() && gamecam::DrivesView());
 	// psobbvr: VR locomotion shaping - scaled turn speed + backwards walking
 	// (psobbvr_movement.hpp); reverts to stock when the takeover stops.
 	movement::OnFrame(gamecam::Enabled());
@@ -1834,17 +1845,25 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	const bool WorldRhw = !CombatText && !UiCaller && Duplicating && Rhw && VertexCount != 0 &&
 	                      stereo::EffectReprojActive() &&
 	                      stereo::IsWorldRhw(ProxyInterface, pVertexStreamZeroData, VertexStreamZeroStride, DrawSite);
+	// psobbvr: whole-screen fades and tints fill each eye image on gameplay
+	// frames instead of tinting the HUD's rectangle (see the screen-fade
+	// block in psobbvr_stereo.hpp).
+	const bool ScreenFill = !CombatText && (!UiCaller || DrawSite == stereo::SCREEN_OVERLAY_SITE) &&
+	                        !WorldRhw && Duplicating && Rhw &&
+	                        VertexCount != 0 && pVertexStreamZeroData != nullptr &&
+	                        stereo::ScreenFillActive() &&
+	                        stereo::IsScreenFill(pVertexStreamZeroData, VertexCount, VertexStreamZeroStride);
 	// psobbvr: with the HUD quad layer active, UI draws (and boxed 3D-UI
 	// passes) render once into the HUD texture, which the backend
 	// composites as its own layer at display rate (placement: [vr]
 	// hud_lock). World sprites and the hidden sun family are excluded as on
 	// the per-eye remap path. Menu world-lock shares the routing
 	// (BindHudLayer picks the target).
-	const bool HudLayer = Duplicating && !CombatText && !WorldRhw &&
+	const bool HudLayer = Duplicating && !CombatText && !WorldRhw && !ScreenFill &&
 	                      (stereo::HudLayerActive() || stereo::MenuLockActive()) &&
 	                      (Rhw || stereo::GameViewportIsBoxed() || stereo::MenuFlatten3dNow());
-	const bool HudRemap = !CombatText && !WorldRhw && !HudLayer && Duplicating && Rhw && stereo::HudRemapActive() &&
-	                      pVertexStreamZeroData != nullptr && VertexCount != 0;
+	const bool HudRemap = !CombatText && !WorldRhw && !ScreenFill && !HudLayer && Duplicating && Rhw &&
+	                      stereo::HudRemapActive() && pVertexStreamZeroData != nullptr && VertexCount != 0;
 	const bool DropAlphaSprite = stereo::drop_alpha_sprite;
 	stereo::drop_alpha_sprite = false;
 	// psobbvr: an alpha-blended world sprite closer than alpha_sprite_floor
@@ -1856,6 +1875,37 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	if (Duplicating && Rhw && VertexCount != 0 &&
 	    stereo::IsHiddenEffect(ProxyInterface, pVertexStreamZeroData, VertexStreamZeroStride))
 		return D3D_OK;
+	if (ScreenFill)
+	{
+		stereo::NoteScreenFill(DrawSite, pVertexStreamZeroData);
+		if (!vrmod::config.screen_fades)
+			return D3D_OK;
+		// Over everything already in the eye images: no depth test or write.
+		DWORD SavedZEnable = D3DZB_TRUE, SavedZWrite = TRUE;
+		ProxyInterface->GetRenderState(D3DRS_ZENABLE, &SavedZEnable);
+		ProxyInterface->GetRenderState(D3DRS_ZWRITEENABLE, &SavedZWrite);
+		ProxyInterface->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+		ProxyInterface->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		stereo::Duplicate(ProxyInterface, [&](int eye) {
+			ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount,
+			                                stereo::ScreenFillVertices(eye, pVertexStreamZeroData, VertexCount, VertexStreamZeroStride),
+			                                VertexStreamZeroStride);
+		}, false, false, true);
+		ProxyInterface->SetRenderState(D3DRS_ZENABLE, SavedZEnable);
+		ProxyInterface->SetRenderState(D3DRS_ZWRITEENABLE, SavedZWrite);
+		return D3D_OK;
+	}
+	// psobbvr: cutscene bars become a darkening of the top and bottom of the
+	// eye images (see the cutscene-bar block in psobbvr_stereo.hpp).
+	if (Duplicating && Rhw && VertexCount != 0 && pVertexStreamZeroData != nullptr &&
+	    VertexStreamZeroStride >= 20 && probe::current_fvf == (D3DFVF_XYZRHW | D3DFVF_DIFFUSE) &&
+	    stereo::IsLetterboxSite(DrawSite) && stereo::LetterboxCaptureActive())
+	{
+		stereo::NoteLetterboxBar(DrawSite, pVertexStreamZeroData, VertexCount, VertexStreamZeroStride);
+		stereo::DrawLetterboxShade(ProxyInterface, DrawSite == stereo::LETTERBOX_TOP_SITE,
+		                           stereo::letterbox_argb);
+		return D3D_OK;
+	}
 	if (CombatText)
 	{
 		// World-anchored per eye; z test off - combat text is never occluded.

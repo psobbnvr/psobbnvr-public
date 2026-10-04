@@ -43,6 +43,7 @@
 #include "psobbvr_gamecam.hpp"
 #include "psobbvr_cullfov.hpp"
 #include "psobbvr_log.hpp"
+#include "psobbvr_settings.hpp"
 #include "psobbvr_textsnap.hpp"
 
 namespace stereo {
@@ -282,7 +283,9 @@ inline void NoteSceneDraw() {
 
 inline void NoteBurstCandidate(IDirect3DDevice9* dev, const void* data,
                                UINT stride) {
-    if (!vrmod::config.burst_3d || !VrDrives())
+    // Counted with burst_3d off too: the latch also tells the camera's
+    // warm-up that the tunnel is on screen (BurstActive applies burst_3d).
+    if (!VrDrives())
         return;
     if (data == nullptr || stride < 16 || !last_persp_proj_valid)
         return;
@@ -376,10 +379,10 @@ inline void LoadConfig() {
     if (!GetCurrentDirectoryA(MAX_PATH, path))
         return;
     strcat_s(path, "\\psobbvr.ini");
-    enabled = GetPrivateProfileIntA("stereo", "enabled", 1, path) != 0;
-    cross_eye = GetPrivateProfileIntA("stereo", "cross_eye", 0, path) != 0;
+    enabled = settings::GetInt("stereo", "enabled", 1, path) != 0;
+    cross_eye = settings::GetInt("stereo", "cross_eye", 0, path) != 0;
     char value[32];
-    if (GetPrivateProfileStringA("stereo", "separation", "", value, sizeof(value), path)) {
+    if (settings::GetString("stereo", "separation", "", value, sizeof(value), path)) {
         const float parsed = (float)atof(value);
         if (parsed > 0.0f && parsed < 100.0f)
             separation = parsed;
@@ -1505,9 +1508,10 @@ inline bool IsWindowSystemSite(uintptr_t site) {
 }
 
 // Fixed-depth HUD draws that look like alpha-blended sprites (SRCALPHA /
-// INVSRCALPHA, depth test on), excluded by site: the screen fade quad
-// (0x8047A4, untextured, z 0.9 = 10 units, full screen) and the
-// equipped-weapon icon (0x81A29D, z 0.2 = 1 unit).
+// INVSRCALPHA, depth test on), excluded by site: the radar's translucent
+// backing box (0x8047A4 in 0x8046B0, called from the radar draw 0x8034E4;
+// untextured, 480,64 128x128, z 0.9 = 10 units) and the equipped-weapon
+// icon (0x81A29D, z 0.2 = 1 unit).
 constexpr uintptr_t HUD_ALPHA_SITES[] = { 0x008047A4, 0x0081A29D };
 
 // Alpha-blended world sprite ([vr] alpha_sprite_rule): e.g. Forest grass
@@ -1616,6 +1620,235 @@ inline bool IsHiddenEffect(IDirect3DDevice9* dev, const void* data, UINT stride)
         return false;
     const float z = reinterpret_cast<const float*>(data)[2];
     return z > 0.4995f && z < 0.5005f;
+}
+
+// ---- Screen fades -----------------------------------------------------------
+//
+// The game fades and tints the whole screen with one untextured quad over
+// its 640x480 screen in a single colour, drawn through the panel drawer
+// 0x82B5D8 (fvf 0x44, a 4-vertex triangle fan): the black fade-out and
+// fade-in objects (draw 0x788820, constructors 0x788938 / 0x7889B0), the
+// black fader held at [0xA9C480] (draw 0x788E20; 0x788F38 fades from
+// black, 0x788F64 to black) and each boss's colour flash (draw 0x4537BC,
+// requested per frame through 0x4538CC). On the HUD layer such a quad only
+// tints the HUD's own rectangle, so on gameplay frames it is drawn over
+// each whole eye image instead, beneath the HUD layer ([vr] screen_fades).
+// Recognised by shape rather than by site, so fades from other code are
+// caught too; window-system draws stay UI, except the screen overlay.
+inline bool ScreenFillActive() {
+    return VrDrives() && gamecam::DrivesView();
+}
+
+// The screen overlay (the red tint on death): window-system routine
+// 0x719A60 draws a full-screen quad in the colour at [0xA98480 + 4]
+// (set through 0x719948, stepped toward a target colour by the colour
+// transition object, update 0x788BB8). Its panel-drawer call site.
+constexpr uintptr_t SCREEN_OVERLAY_SITE = 0x00719B13;
+
+inline bool IsScreenFill(const void* data, UINT vertex_count, UINT stride) {
+    if (probe::current_fvf != (D3DFVF_XYZRHW | D3DFVF_DIFFUSE) || stride < 20 ||
+        vertex_count < 3 || vertex_count > 8)
+        return false;
+    const auto* base = static_cast<const uint8_t*>(data);
+    const DWORD colour = *reinterpret_cast<const DWORD*>(base + 16);
+    float x_min = 1e30f, x_max = -1e30f, y_min = 1e30f, y_max = -1e30f;
+    for (UINT i = 0; i < vertex_count; i++) {
+        const uint8_t* v = base + size_t(i) * stride;
+        const float* xy = reinterpret_cast<const float*>(v);
+        if (*reinterpret_cast<const DWORD*>(v + 16) != colour)
+            return false;
+        if (xy[0] < x_min) x_min = xy[0];
+        if (xy[0] > x_max) x_max = xy[0];
+        if (xy[1] < y_min) y_min = xy[1];
+        if (xy[1] > y_max) y_max = xy[1];
+    }
+    return x_min <= 1.0f && y_min <= 1.0f &&
+           x_max >= resolution::kGameWidth - 1.0f && y_max >= resolution::kGameHeight - 1.0f;
+}
+
+inline std::vector<uint8_t> fill_scratch;
+
+// The quad stretched over this eye's whole half of the wide target (each
+// corner snapped to the nearer edge), nearest depth. Valid until the next
+// call.
+inline const void* ScreenFillVertices(int eye, const void* data, UINT vertex_count, UINT stride) {
+    const auto* src = static_cast<const uint8_t*>(data);
+    fill_scratch.assign(src, src + size_t(vertex_count) * stride);
+    uint8_t* vertex = fill_scratch.data();
+    for (UINT i = 0; i < vertex_count; i++, vertex += stride) {
+        float* v = reinterpret_cast<float*>(vertex);
+        v[0] = (float)(eye * eye_width) +
+               (v[0] < resolution::kGameWidth * 0.5f ? 0.0f : (float)eye_width);
+        v[1] = v[1] < resolution::kGameHeight * 0.5f ? 0.0f : (float)eye_height;
+        v[2] = 0.0f;
+        v[3] = 1.0f;
+    }
+    return fill_scratch.data();
+}
+
+// Fade log: one line when a fade starts (its site and colour) and one when
+// it ends (frames shown, peak alpha), so a play session tells which code
+// drew which fade.
+inline unsigned fill_frame = 0;
+inline unsigned fill_last_frame = 0;
+inline bool fill_running = false;
+inline uintptr_t fill_site = 0;
+inline DWORD fill_rgb = 0;
+inline unsigned fill_frames = 0, fill_peak_alpha = 0;
+
+inline void ScreenFillLogEnd() {
+    diag::Log("screenfade: end site=%08X rgb=%06X after %u draws, peak alpha %u",
+              (unsigned)fill_site, (unsigned)fill_rgb, fill_frames, fill_peak_alpha);
+    fill_running = false;
+}
+
+inline void NoteScreenFill(uintptr_t site, const void* data) {
+    const DWORD colour = *reinterpret_cast<const DWORD*>(static_cast<const uint8_t*>(data) + 16);
+    const unsigned alpha = colour >> 24;
+    const DWORD rgb = colour & 0xFFFFFF;
+    if (fill_running && (site != fill_site || rgb != fill_rgb))
+        ScreenFillLogEnd();
+    if (!fill_running) {
+        if (alpha == 0)
+            return;
+        fill_running = true;
+        fill_site = site;
+        fill_rgb = rgb;
+        fill_frames = 0;
+        fill_peak_alpha = 0;
+        diag::Log("screenfade: start site=%08X rgb=%06X alpha %u%s", (unsigned)site,
+                  (unsigned)rgb, alpha, vrmod::config.screen_fades ? "" : " (screen_fades 0: skipped)");
+    }
+    fill_frames++;
+    if (alpha > fill_peak_alpha)
+        fill_peak_alpha = alpha;
+    fill_last_frame = fill_frame;
+}
+
+inline void ScreenFillFrameEnd() {
+    fill_frame++;
+    if (fill_running && fill_frame - fill_last_frame > 2)
+        ScreenFillLogEnd();
+}
+
+// ---- Cutscene bars ----------------------------------------------------------
+//
+// The letterbox over quest conversations: the bar object's draw 0x77F254
+// (vtable 0xB44670) draws two full-width bars through the panel drawer,
+// (0,0)-(640,h) at site 0x77F356 and (0,480-h)-(640,480) at 0x77F3EF, in
+// the colour at +0x24 with its alpha from +0x1C. On the HUD layer they
+// only edge the HUD's rectangle; with [vr] letterbox the game's draws are
+// skipped and the top and bottom of each eye image darken instead
+// (DrawLetterboxShade).
+constexpr uintptr_t LETTERBOX_TOP_SITE = 0x0077F356;
+constexpr uintptr_t LETTERBOX_BOTTOM_SITE = 0x0077F3EF;
+
+// This frame's bars, for the log: inner edges in 640x480 space (0 / 480 =
+// none drawn) and colour.
+inline float letterbox_top = 0.0f;
+inline float letterbox_bottom = resolution::kGameHeight;
+inline DWORD letterbox_argb = 0;
+inline bool letterbox_was_on = false;
+inline unsigned letterbox_peak_alpha = 0;
+
+inline bool LetterboxCaptureActive() {
+    return vrmod::config.letterbox && ScreenFillActive();
+}
+
+inline bool IsLetterboxSite(uintptr_t site) {
+    return site == LETTERBOX_TOP_SITE || site == LETTERBOX_BOTTOM_SITE;
+}
+
+inline void NoteLetterboxBar(uintptr_t site, const void* data, UINT vertex_count, UINT stride) {
+    const auto* base = static_cast<const uint8_t*>(data);
+    float y_min = 1e30f, y_max = -1e30f;
+    for (UINT i = 0; i < vertex_count; i++) {
+        const float y = reinterpret_cast<const float*>(base + size_t(i) * stride)[1];
+        if (y < y_min) y_min = y;
+        if (y > y_max) y_max = y;
+    }
+    if (site == LETTERBOX_TOP_SITE)
+        letterbox_top = y_max;
+    else
+        letterbox_bottom = y_min;
+    letterbox_argb = *reinterpret_cast<const DWORD*>(base + 16);
+}
+
+// The darkening, drawn into each eye image at the bar's own draw (the
+// game's states: fvf 0x44, alpha blended, untextured) as a vertex strip
+// whose alpha the rasterizer interpolates: solid from the image edge to
+// letterbox_outer_deg, then a smoothstep in SHADE_STEPS steps to clear at
+// letterbox_inner_deg, each row placed through the eye's own projection
+// (linear in tan of the angle). The eye images are rendered wider than
+// the view, so it reaches past the view's edge (a head-locked
+// compositor quad leaves a thin undarkened rim there).
+struct ShadeVertex {
+    float x, y, z, rhw;
+    DWORD colour;
+};
+constexpr int SHADE_STEPS = 16;
+inline ShadeVertex shade_strip[2 * (SHADE_STEPS + 2)];
+
+inline UINT LetterboxShadeVertices(int eye, bool top, DWORD argb) {
+    D3DMATRIX p;
+    vrmod::Get()->GetEyeProjection(eye, p);
+    const float to_rad = 3.14159265f / 180.0f;
+    float inner = vrmod::config.letterbox_inner_deg;
+    if (inner < 0.0f) inner = 0.0f;
+    if (inner > 60.0f) inner = 60.0f;
+    float outer = vrmod::config.letterbox_outer_deg;
+    if (outer < inner + 1.0f) outer = inner + 1.0f;
+    if (outer > 80.0f) outer = 80.0f;
+    float strength = vrmod::config.letterbox_strength;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    const float peak = strength * (float)(argb >> 24) / 255.0f;
+    const DWORD rgb = argb & 0xFFFFFF;
+    const float sign = top ? 1.0f : -1.0f;
+    // Pixel row of the direction tan_up above (negative: below) the eye's
+    // axis: ndc y = tan * _22 - _32 at view z = -1.
+    auto row = [&](float tan_up) {
+        return (0.5f - 0.5f * (tan_up * p._22 - p._32)) * (float)eye_height;
+    };
+    const float t_in = tanf(inner * to_rad), t_out = tanf(outer * to_rad);
+    const float r_out = row(sign * t_out);
+    const float r_edge = top ? (r_out < 0.0f ? r_out : 0.0f)
+                             : (r_out > (float)eye_height ? r_out : (float)eye_height);
+    const float x0 = (float)(eye * eye_width), x1 = x0 + (float)eye_width;
+    UINT n = 0;
+    auto pair = [&](float r, float a) {
+        const DWORD c = ((DWORD)(a * 255.0f + 0.5f) << 24) | rgb;
+        shade_strip[n++] = {x0, r, 0.0f, 1.0f, c};
+        shade_strip[n++] = {x1, r, 0.0f, 1.0f, c};
+    };
+    pair(r_edge, peak);
+    pair(r_out, peak);
+    for (int k = 1; k <= SHADE_STEPS; k++) {
+        const float f = (float)k / (float)SHADE_STEPS;  // 0 = outer, 1 = inner
+        const float s = 1.0f - f;
+        pair(row(sign * (t_out + (t_in - t_out) * f)), peak * s * s * (3.0f - 2.0f * s));
+    }
+    return n;
+}
+
+// After Present: log the bars coming and going (with their peak alpha),
+// then no bars until the next frame draws them.
+inline void LetterboxFrameEnd() {
+    const bool on = letterbox_top > 0.5f || letterbox_bottom < resolution::kGameHeight - 0.5f;
+    if (on && (letterbox_argb >> 24) > letterbox_peak_alpha)
+        letterbox_peak_alpha = letterbox_argb >> 24;
+    if (on != letterbox_was_on) {
+        letterbox_was_on = on;
+        if (on) {
+            diag::Log("letterbox: bars on (top to %.0f, bottom from %.0f, argb %08X)",
+                      letterbox_top, letterbox_bottom, (unsigned)letterbox_argb);
+        } else {
+            diag::Log("letterbox: bars off (peak alpha %u)", letterbox_peak_alpha);
+            letterbox_peak_alpha = 0;
+        }
+    }
+    letterbox_top = 0.0f;
+    letterbox_bottom = resolution::kGameHeight;
 }
 
 
@@ -1817,6 +2050,25 @@ inline void Duplicate(IDirect3DDevice9* dev, CallFn&& call, bool hud = false,
     }
 }
 
+// The darkening (see LetterboxShadeVertices): one band per bar draw.
+inline void DrawLetterboxShade(IDirect3DDevice9* dev, bool top, DWORD argb) {
+    // Over everything already in the eye images, either winding.
+    DWORD z_enable = D3DZB_TRUE, z_write = TRUE, cull = D3DCULL_CCW;
+    dev->GetRenderState(D3DRS_ZENABLE, &z_enable);
+    dev->GetRenderState(D3DRS_ZWRITEENABLE, &z_write);
+    dev->GetRenderState(D3DRS_CULLMODE, &cull);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    Duplicate(dev, [&](int eye) {
+        const UINT n = LetterboxShadeVertices(eye, top, argb);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, n - 2, shade_strip, sizeof(ShadeVertex));
+    }, false, false, true);
+    dev->SetRenderState(D3DRS_ZENABLE, z_enable);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, z_write);
+    dev->SetRenderState(D3DRS_CULLMODE, cull);
+}
+
 // Squeeze both eye images side by side onto the real backbuffer and restore
 // the backbuffer + game depth-stencil as the render target so later draws
 // (the overlay panel) land on the visible frame.
@@ -1894,6 +2146,8 @@ inline void FinishFrame() {
 inline void OnFrameEnd() {
     composited = false;
     paused = false;
+    ScreenFillFrameEnd();
+    LetterboxFrameEnd();
     // Fresh WaitPoses pose (and possibly a fresh menu anchor) next frame.
     InvalidateEyeCache();
     // Menu-open viewport latch (see NoteGameViewport).
@@ -1907,6 +2161,9 @@ inline void OnFrameEnd() {
                   burst_next ? "ON" : "off", burst_candidates);
     burst_active = burst_next;
     burst_candidates = 0;
+    // The raw latch, whatever burst_3d says: the camera's warm-up holds off
+    // over the tunnel either way.
+    gamecam::tunnel_latched = burst_active;
     // Teleport-warp latch (see the warp block). DrivesView still reports
     // the ended frame here (gamecam::Apply resets it next frame).
     const bool warp_next = vrmod::config.burst_3d && gamecam::DrivesView() &&

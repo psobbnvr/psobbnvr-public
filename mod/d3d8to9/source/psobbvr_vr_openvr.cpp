@@ -18,6 +18,7 @@
 #include "psobbvr_vr.hpp"
 #include "psobbvr_log.hpp"
 #include "psobbvr_probe.hpp"
+#include "psobbvr_settings.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,21 +34,29 @@ void LoadConfig() {
     if (!GetCurrentDirectoryA(MAX_PATH, path))
         return;
     strcat_s(path, "\\psobbvr.ini");
-    config.enabled = GetPrivateProfileIntA("vr", "enabled", 1, path) != 0;
+    // An older full psobbvr.ini becomes a player file (psobbvr_settings.hpp);
+    // the dinput8 proxy has normally done it already, at load.
+    const settings::TidyResult tidy = settings::Tidy(path);
+    if (tidy.note[0] != '\0')
+        diag::Log("settings: %s", tidy.note);
+    config.enabled = settings::GetInt("vr", "enabled", 1, path) != 0;
     char backend[16] = "";
-    GetPrivateProfileStringA("vr", "backend", "openxr", backend, sizeof(backend), path);
+    settings::GetString("vr", "backend", "openxr", backend, sizeof(backend), path);
     config.backend_openxr = _stricmp(backend, "openxr") == 0;
-    const int gamecam = GetPrivateProfileIntA("vr", "game_camera", 1, path);
+    const int gamecam = settings::GetInt("vr", "game_camera", 1, path);
     if (gamecam >= 0 && gamecam <= 2)
         config.game_camera = gamecam;
-    config.hide_sun = GetPrivateProfileIntA("vr", "hide_sun", 1, path) != 0;
-    config.trim_head = GetPrivateProfileIntA("vr", "trim_head", 1, path) != 0;
-    const int body_cull = GetPrivateProfileIntA("vr", "body_cull", 1, path);
+    config.warmup_drive = settings::GetInt("vr", "warmup_drive", 1, path) != 0;
+    config.hide_sun = settings::GetInt("vr", "hide_sun", 1, path) != 0;
+    config.screen_fades = settings::GetInt("vr", "screen_fades", 1, path) != 0;
+    config.letterbox = settings::GetInt("vr", "letterbox", 1, path) != 0;
+    config.trim_head = settings::GetInt("vr", "trim_head", 1, path) != 0;
+    const int body_cull = settings::GetInt("vr", "body_cull", 1, path);
     if (body_cull >= 0 && body_cull <= 2)
         config.body_cull = body_cull;
     char value[32];
     auto read_float = [&](const char *key, float min, float max, float &out) {
-        if (GetPrivateProfileStringA("vr", key, "", value, sizeof(value), path)) {
+        if (settings::GetString("vr", key, "", value, sizeof(value), path)) {
             const float parsed = (float)atof(value);
             if (parsed > min && parsed < max)
                 out = parsed;
@@ -60,59 +69,63 @@ void LoadConfig() {
     read_float("hud_width_deg", 10.0f, 160.0f, config.hud_width_deg);
     read_float("hud_height_deg", -30.001f, 10.001f, config.hud_height_deg);
     read_float("text_scale", 0.049f, 3.001f, config.text_scale);
-    config.hud_layer = GetPrivateProfileIntA("vr", "hud_layer", 1, path) != 0;
-    const int hud_tex_w = GetPrivateProfileIntA("vr", "hud_tex_width", 1600, path);
+    config.hud_layer = settings::GetInt("vr", "hud_layer", 1, path) != 0;
+    const int hud_tex_w = settings::GetInt("vr", "hud_tex_width", 1600, path);
     if (hud_tex_w >= 320 && hud_tex_w <= 4096)
         config.hud_tex_width = hud_tex_w;
-    const int hud_lock = GetPrivateProfileIntA("vr", "hud_lock", 1, path);
+    const int hud_lock = settings::GetInt("vr", "hud_lock", 1, path);
     if (hud_lock >= 0 && hud_lock <= 2)
         config.hud_lock = hud_lock;
     read_float("hud_follow_deg", -0.001f, 90.001f, config.hud_follow_deg);
+    read_float("hud_follow_menu_deg", -0.001f, 90.001f, config.hud_follow_menu_deg);
     read_float("hud_follow_wait_s", -0.001f, 5.001f, config.hud_follow_wait_s);
     read_float("hud_follow_glide_s", 0.049f, 3.001f, config.hud_follow_glide_s);
-    config.vr_keyboard = GetPrivateProfileIntA("vr", "vr_keyboard", 1, path) != 0;
+    read_float("letterbox_inner_deg", -0.001f, 60.001f, config.letterbox_inner_deg);
+    read_float("letterbox_outer_deg", 0.999f, 75.001f, config.letterbox_outer_deg);
+    read_float("letterbox_strength", -0.001f, 1.001f, config.letterbox_strength);
+    config.vr_keyboard = settings::GetInt("vr", "vr_keyboard", 1, path) != 0;
     read_float("keyboard_distance_m", 0.2f, 3.0f, config.keyboard_distance_m);
     read_float("keyboard_drop_m", -1.0f, 1.5f, config.keyboard_drop_m);
     read_float("keyboard_width_m", 0.2f, 3.0f, config.keyboard_width_m);
-    config.menu_lock = GetPrivateProfileIntA("vr", "menu_lock", 1, path) != 0;
+    config.menu_lock = settings::GetInt("vr", "menu_lock", 1, path) != 0;
     read_float("menu_distance_m", 0.3f, 50.0f, config.menu_distance_m);
     read_float("menu_width_deg", 10.0f, 160.0f, config.menu_width_deg);
     read_float("menu_below_distance_m", 0.3f, 50.0f, config.menu_below_distance_m);
     read_float("menu_depth_scale", 0.199f, 10.001f, config.menu_depth_scale);
     read_float("menu_float_overlap", 0.009f, 1.001f, config.menu_float_overlap);
-    config.glow_below = GetPrivateProfileIntA("vr", "glow_below", 1, path) != 0;
-    config.burst_3d = GetPrivateProfileIntA("vr", "burst_3d", 1, path) != 0;
-    config.object_vis_fix = GetPrivateProfileIntA("vr", "object_vis_fix", 1, path) != 0;
-    config.mag_glitch_fix = GetPrivateProfileIntA("vr", "mag_glitch_fix", 1, path) != 0;
-    config.mag_root_sync = GetPrivateProfileIntA("vr", "mag_root_sync", 1, path) != 0;
-    config.name_labels = GetPrivateProfileIntA("vr", "name_labels", 1, path) != 0;
-    config.trail_depth_fix = GetPrivateProfileIntA("vr", "trail_depth_fix", 1, path) != 0;
-    config.trail_cross = GetPrivateProfileIntA("vr", "trail_cross", 1, path) != 0;
-    config.controllers = GetPrivateProfileIntA("vr", "controllers", 1, path) != 0;
+    config.glow_below = settings::GetInt("vr", "glow_below", 1, path) != 0;
+    config.burst_3d = settings::GetInt("vr", "burst_3d", 1, path) != 0;
+    config.object_vis_fix = settings::GetInt("vr", "object_vis_fix", 1, path) != 0;
+    config.mag_glitch_fix = settings::GetInt("vr", "mag_glitch_fix", 1, path) != 0;
+    config.mag_root_sync = settings::GetInt("vr", "mag_root_sync", 1, path) != 0;
+    config.name_labels = settings::GetInt("vr", "name_labels", 1, path) != 0;
+    config.trail_depth_fix = settings::GetInt("vr", "trail_depth_fix", 1, path) != 0;
+    config.trail_cross = settings::GetInt("vr", "trail_cross", 1, path) != 0;
+    config.controllers = settings::GetInt("vr", "controllers", 1, path) != 0;
     config.allow_any_runtime =
-        GetPrivateProfileIntA("vr", "allow_any_runtime", 0, path) != 0;
+        settings::GetInt("vr", "allow_any_runtime", 0, path) != 0;
     config.vr_fail_message =
-        GetPrivateProfileIntA("vr", "vr_fail_message", 1, path) != 0;
+        settings::GetInt("vr", "vr_fail_message", 1, path) != 0;
     config.vr_fail_exit =
-        GetPrivateProfileIntA("vr", "vr_fail_exit", 1, path) != 0;
-    config.hotkey_arm = GetPrivateProfileIntA("vr", "hotkey_arm", 1, path) != 0;
+        settings::GetInt("vr", "vr_fail_exit", 1, path) != 0;
+    config.hotkey_arm = settings::GetInt("vr", "hotkey_arm", 1, path) != 0;
     read_float("hotkey_arm_timeout_s", 0.2f, 30.0f, config.hotkey_arm_timeout_s);
     read_float("controller_turn_min", 0.049f, 1.001f, config.controller_turn_min);
     read_float("controller_turn_max", 0.049f, 1.001f, config.controller_turn_max);
     read_float("controller_deadzone", 0.009f, 0.6f, config.controller_deadzone);
     read_float("controller_press", 0.199f, 0.95f, config.controller_press);
-    if (GetPrivateProfileIntA("vr", "controller_side_sign", 1, path) < 0)
+    if ((int)settings::GetInt("vr", "controller_side_sign", 1, path) < 0)
         config.controller_side_sign = -1.0f;
-    config.stick_locomotion = GetPrivateProfileIntA("vr", "stick_locomotion", 1, path) != 0;
+    config.stick_locomotion = settings::GetInt("vr", "stick_locomotion", 1, path) != 0;
     read_float("stick_turn_deg_s", 9.9f, 360.001f, config.stick_turn_deg_s);
     read_float("stick_speed_floor", 0.009f, 1.001f, config.stick_speed_floor);
-    const int head_move = GetPrivateProfileIntA("vr", "head_move", 0, path);
+    const int head_move = settings::GetInt("vr", "head_move", 0, path);
     if (head_move >= 0 && head_move <= 2)
         config.head_move = head_move;
     read_float("eye_height_m", 0.1f, 5.0f, config.eye_height_m);
     // Dynamic eye height (see Config::eye_height_auto).
     config.eye_height_auto =
-        GetPrivateProfileIntA("vr", "eye_height_auto", 1, path) != 0 ? 1 : 0;
+        settings::GetInt("vr", "eye_height_auto", 1, path) != 0 ? 1 : 0;
     read_float("eye_offset_m", -0.5f, 0.5f, config.eye_offset_m);
     read_float("trail_cross_gain", -0.01f, 1.01f, config.trail_cross_gain);
     read_float("eye_forward_m", -0.5f, 0.5f, config.eye_forward_m);
@@ -123,9 +136,9 @@ void LoadConfig() {
     read_float("cull_fov_scale_town", 0.0f, 1.0f, config.cull_fov_scale_town);
     read_float("draw_distance_scale", 0.24f, 16.001f, config.draw_distance_scale);
     read_float("turn_speed_scale", 0.049f, 1.001f, config.turn_speed_scale);
-    config.back_strafe = GetPrivateProfileIntA("vr", "back_strafe", 1, path) != 0;
+    config.back_strafe = settings::GetInt("vr", "back_strafe", 1, path) != 0;
     read_float("back_speed_scale", 0.299f, 1.001f, config.back_speed_scale);
-    config.side_turn = GetPrivateProfileIntA("vr", "side_turn", 1, path) != 0;
+    config.side_turn = settings::GetInt("vr", "side_turn", 1, path) != 0;
     read_float("side_turn_speed_scale", 0.009f, 1.001f, config.side_turn_speed_scale);
     read_float("trim_radius_m", 0.01f, 2.0f, config.trim_radius_m);
     read_float("trim_wide_m", 0.1f, 5.0f, config.trim_wide_m);
@@ -133,26 +146,26 @@ void LoadConfig() {
     // Target-selection aim steering (see Config::target_aim). 0-7 bitmask
     // (bit 4 = tech banks on the left ray); out-of-range falls back to 7.
     {
-        const int ta = GetPrivateProfileIntA("vr", "target_aim", 7, path);
+        const int ta = settings::GetInt("vr", "target_aim", 7, path);
         config.target_aim = (ta >= 0 && ta <= 7) ? ta : 7;
     }
     read_float("target_aim_cone_scale", 0.199f, 1.501f,
                config.target_aim_cone_scale);
     // VR spellcasting (see Config::cast_swing).
     config.cast_swing =
-        GetPrivateProfileIntA("vr", "cast_swing", 1, path) != 0;
+        settings::GetInt("vr", "cast_swing", 1, path) != 0;
     config.cast_left_hand =
-        GetPrivateProfileIntA("vr", "cast_left_hand", 1, path) != 0;
+        settings::GetInt("vr", "cast_left_hand", 1, path) != 0;
     config.cast_facing_snap =
-        GetPrivateProfileIntA("vr", "cast_facing_snap", 0, path) != 0;
+        settings::GetInt("vr", "cast_facing_snap", 0, path) != 0;
     read_float("cast_aim_cone_deg", 4.999f, 90.001f,
                config.cast_aim_cone_deg);
     // -1 = auto, else a tech-id bitmask (see Config::cast_aim_techs);
     // decimal or 0x hex.
     {
         char buf[32] = {};
-        GetPrivateProfileStringA("vr", "cast_aim_techs", "-1", buf,
-                                 sizeof(buf), path);
+        settings::GetString("vr", "cast_aim_techs", "-1", buf,
+                            sizeof(buf), path);
         char* end = nullptr;
         const long m = strtol(buf, &end, 0);
         config.cast_aim_techs =
@@ -160,69 +173,69 @@ void LoadConfig() {
     }
     // Honest gun bullet origin (see Config::gun_fire_origin).
     config.gun_fire_origin =
-        GetPrivateProfileIntA("vr", "gun_fire_origin", 1, path) != 0;
+        settings::GetInt("vr", "gun_fire_origin", 1, path) != 0;
     read_float("gun_muzzle_offset_m", -0.501f, 0.501f,
                config.gun_muzzle_offset_m);
     read_float("gun_barrel_pitch_deg", -45.001f, 45.001f,
                config.gun_barrel_pitch_deg);
     config.gun_facing_snap =
-        GetPrivateProfileIntA("vr", "gun_facing_snap", 0, path) != 0;
+        settings::GetInt("vr", "gun_facing_snap", 0, path) != 0;
     config.attack_view_hold =
-        GetPrivateProfileIntA("vr", "attack_view_hold", 1, path) != 0;
+        settings::GetInt("vr", "attack_view_hold", 1, path) != 0;
     config.attack_retarget =
-        GetPrivateProfileIntA("vr", "attack_retarget", 1, path) != 0;
+        settings::GetInt("vr", "attack_retarget", 1, path) != 0;
     read_float("retarget_cone_deg", 4.999f, 180.001f, config.retarget_cone_deg);
     // Per-hand mechguns (see Config::mechgun_dual).
     config.mechgun_dual =
-        GetPrivateProfileIntA("vr", "mechgun_dual", 1, path) != 0;
+        settings::GetInt("vr", "mechgun_dual", 1, path) != 0;
     config.mechgun_swap_barrels =
-        GetPrivateProfileIntA("vr", "mechgun_swap_barrels", 0, path) != 0;
+        settings::GetInt("vr", "mechgun_swap_barrels", 0, path) != 0;
     config.mechgun_reticle =
-        GetPrivateProfileIntA("vr", "mechgun_reticle", 1, path) != 0;
+        settings::GetInt("vr", "mechgun_reticle", 1, path) != 0;
     config.mechgun_union =
-        GetPrivateProfileIntA("vr", "mechgun_union", 1, path) != 0;
+        settings::GetInt("vr", "mechgun_union", 1, path) != 0;
     config.mechgun_merge_popups =
-        GetPrivateProfileIntA("vr", "mechgun_merge_popups", 1, path) != 0;
+        settings::GetInt("vr", "mechgun_merge_popups", 1, path) != 0;
     // Combat haptics (see Config::gun_haptic and psobbvr_haptics.hpp).
     {
-        const int gh = GetPrivateProfileIntA("vr", "gun_haptic", 2, path);
+        const int gh = settings::GetInt("vr", "gun_haptic", 2, path);
         config.gun_haptic = (gh >= 0 && gh <= 2) ? gh : 2;
     }
     read_float("gun_haptic_amp", 0.049f, 1.001f, config.gun_haptic_amp);
     read_float("gun_haptic_s", 0.009f, 0.501f, config.gun_haptic_s);
     config.hit_haptic =
-        GetPrivateProfileIntA("vr", "hit_haptic", 1, path) != 0;
+        settings::GetInt("vr", "hit_haptic", 1, path) != 0;
     read_float("hit_haptic_amp", 0.049f, 1.001f, config.hit_haptic_amp);
     read_float("hit_haptic_s", 0.009f, 0.501f, config.hit_haptic_s);
     config.hurt_haptic =
-        GetPrivateProfileIntA("vr", "hurt_haptic", 1, path) != 0;
+        settings::GetInt("vr", "hurt_haptic", 1, path) != 0;
     read_float("hurt_haptic_amp", 0.049f, 1.001f, config.hurt_haptic_amp);
     read_float("hurt_haptic_s", 0.009f, 0.501f, config.hurt_haptic_s);
     read_float("sprite_near_floor", 0.499f, 20.001f,
                config.sprite_near_floor);
-    config.ui_caller_rule = GetPrivateProfileIntA("vr", "ui_caller_rule", 1, path) != 0;
-    config.alpha_sprite_rule = GetPrivateProfileIntA("vr", "alpha_sprite_rule", 1, path) != 0;
+    config.ui_caller_rule = settings::GetInt("vr", "ui_caller_rule", 1, path) != 0;
+    config.alpha_sprite_rule = settings::GetInt("vr", "alpha_sprite_rule", 1, path) != 0;
     read_float("alpha_sprite_floor", -0.001f, 20.001f, config.alpha_sprite_floor);
-    config.sprite_upright = GetPrivateProfileIntA("vr", "sprite_upright", 1, path) != 0;
+    config.sprite_upright = settings::GetInt("vr", "sprite_upright", 1, path) != 0;
     {
         char buf[256] = {};
         // Default 24 = the telepipe beam pool.
-        GetPrivateProfileStringA("vr", "sprite_upright_pools", "24", buf, sizeof(buf), path);
+        settings::GetString("vr", "sprite_upright_pools", "24", buf, sizeof(buf), path);
         config.SetUprightPools(buf);
     }
     // Armed-swing mode (see Config::swing_attack).
     {
-        const int sw = GetPrivateProfileIntA("vr", "swing_attack", 2, path);
+        const int sw = settings::GetInt("vr", "swing_attack", 2, path);
         config.swing_attack = (sw >= 0 && sw <= 2) ? sw : 2;
     }
-    config.swing_unarmed = GetPrivateProfileIntA("vr", "swing_unarmed", 1, path) != 0;
+    config.swing_unarmed = settings::GetInt("vr", "swing_unarmed", 1, path) != 0;
     read_float("swing_onset", 0.199f, 10.001f, config.swing_onset);
     read_float("swing_release", 0.049f, 10.001f, config.swing_release);
     read_float("swing_refractory_s", -0.001f, 2.001f, config.swing_refractory_s);
     read_float("swing_glitch_cap", 1.999f, 100.001f, config.swing_glitch_cap);
     // Charge hold (see Config::charge_hold).
     config.charge_hold =
-        GetPrivateProfileIntA("vr", "charge_hold", 1, path) != 0;
+        settings::GetInt("vr", "charge_hold", 1, path) != 0;
     read_float("charge_hold_timeout_s", -0.001f, 60.001f,
                config.charge_hold_timeout_s);
     // Swing warp (see Config::swing_warp_margin).
@@ -231,27 +244,27 @@ void LoadConfig() {
     // Combo-window stretch (see Config::combo_window_bonus).
     {
         const int cw =
-            GetPrivateProfileIntA("vr", "combo_window_bonus", 6, path);
+            settings::GetInt("vr", "combo_window_bonus", 6, path);
         if (cw >= 0 && cw <= 60)
             config.combo_window_bonus = cw;
     }
     // The multi-hit per-row hold (see Config::swing_row_hold).
     config.swing_row_hold =
-        GetPrivateProfileIntA("vr", "swing_row_hold", 1, path) != 0;
+        settings::GetInt("vr", "swing_row_hold", 1, path) != 0;
     read_float("swing_row_hold_margin", 0.999f, 10.001f,
                config.swing_row_hold_margin);
     {
         const int cap =
-            GetPrivateProfileIntA("vr", "swing_row_hold_cap", 30, path);
+            settings::GetInt("vr", "swing_row_hold_cap", 30, path);
         if (cap >= 0 && cap <= 300)
             config.swing_row_hold_cap = cap;
     }
     // The left hand's swing with a twin weapon (see Config::swing_left_hand).
     config.swing_left_hand =
-        GetPrivateProfileIntA("vr", "swing_left_hand", 1, path) != 0;
+        settings::GetInt("vr", "swing_left_hand", 1, path) != 0;
     // Swing-timing indicator (see Config::swing_indicator).
     config.swing_indicator =
-        GetPrivateProfileIntA("vr", "swing_indicator", 1, path) != 0;
+        settings::GetInt("vr", "swing_indicator", 1, path) != 0;
     read_float("swing_indicator_x", -0.001f, 640.001f, config.swing_indicator_x);
     read_float("swing_indicator_y", -0.001f, 480.001f, config.swing_indicator_y);
     read_float("swing_indicator_ring", 0.999f, 400.001f, config.swing_indicator_ring);
@@ -260,30 +273,33 @@ void LoadConfig() {
     read_float("swing_indicator_scale", 0.099f, 10.001f, config.swing_indicator_scale);
     {
         const int spin =
-            GetPrivateProfileIntA("vr", "swing_indicator_spin", 1, path);
+            settings::GetInt("vr", "swing_indicator_spin", 1, path);
         if (spin >= 1 && spin <= 30)
             config.swing_indicator_spin = spin;
     }
+    // Readied-hotkey highlight (see Config::hotkey_highlight).
+    config.hotkey_highlight =
+        settings::GetInt("vr", "hotkey_highlight", 1, path) != 0;
     read_float("trig_pair_window_s", 0.049f, 1.001f,
                config.trig_pair_window_s);
-    const int sw_conf = GetPrivateProfileIntA("vr", "swing_confirm", 2, path);
+    const int sw_conf = settings::GetInt("vr", "swing_confirm", 2, path);
     if (sw_conf >= 1 && sw_conf <= 10)
         config.swing_confirm = sw_conf;
     // First-person arm hide (see Config::hide_arms).
-    config.hide_arms = GetPrivateProfileIntA("vr", "hide_arms", 1, path) != 0;
-    const int arm_n = GetPrivateProfileIntA("vr", "hide_arms_count", 58, path);
+    config.hide_arms = settings::GetInt("vr", "hide_arms", 1, path) != 0;
+    const int arm_n = settings::GetInt("vr", "hide_arms_count", 58, path);
     if (arm_n >= 0 && arm_n <= 400)
         config.hide_arms_count = arm_n;
     // Weapon on the right grip pose (see Config::weapon_grip). Offsets
     // may legitimately be zero or negative.
-    config.weapon_grip = GetPrivateProfileIntA("vr", "weapon_grip", 1, path) != 0;
+    config.weapon_grip = settings::GetInt("vr", "weapon_grip", 1, path) != 0;
     // Dual-wield split - off-hand half onto the left grip pose.
-    config.twin_split = GetPrivateProfileIntA("vr", "twin_split", 1, path) != 0;
+    config.twin_split = settings::GetInt("vr", "twin_split", 1, path) != 0;
     read_float("weapon_scale", 0.099f, 2.001f, config.weapon_scale);
     // Motion-controlled hands (psobbvr_hands.hpp).
-    config.hand_presence = GetPrivateProfileIntA("vr", "hand_presence", 1, path) != 0;
+    config.hand_presence = settings::GetInt("vr", "hand_presence", 1, path) != 0;
     read_float("hand_scale", 0.099f, 2.001f, config.hand_scale);
-    config.hand_cull_flip = GetPrivateProfileIntA("vr", "hand_cull_flip", 0, path) != 0;
+    config.hand_cull_flip = settings::GetInt("vr", "hand_cull_flip", 0, path) != 0;
     read_float("hand_pitch_deg", -180.001f, 180.001f, config.hand_pitch_deg);
     read_float("hand_roll_deg", -180.001f, 180.001f, config.hand_roll_deg);
     read_float("hand_yaw_deg", -180.001f, 180.001f, config.hand_yaw_deg);
@@ -307,7 +323,7 @@ void LoadConfig() {
     read_float("fist_side_cm", -50.001f, 50.001f, config.fist_side_cm);
     // IK arms (psobbvr_ikarms.hpp).
     {
-        const int ik = GetPrivateProfileIntA("vr", "ik_arms", 0, path);
+        const int ik = settings::GetInt("vr", "ik_arms", 0, path);
         if (ik >= 0 && ik <= 2)
             config.ik_arms = ik;
     }
@@ -320,7 +336,7 @@ void LoadConfig() {
     read_float("ik_shoulder_in_cm", -30.001f, 30.001f, config.ik_shoulder_in_cm);
     read_float("ik_twist", -0.001f, 1.001f, config.ik_twist);
     {
-        const int anchor = GetPrivateProfileIntA("vr", "ik_anchor", 2, path);
+        const int anchor = settings::GetInt("vr", "ik_anchor", 2, path);
         if (anchor >= 0 && anchor <= 2)
             config.ik_anchor = anchor;
     }
@@ -334,13 +350,18 @@ void LoadConfig() {
 #endif
     char section[512];
     const DWORD bind_n =
-        GetPrivateProfileSectionA("bindings", section, sizeof(section), path);
-    diag::Log("launch: psobbvr d3d8 build %s (compiled %s %s); ini %s",
-              PSOBBVR_GIT_REV, __DATE__, __TIME__, path);
+        settings::GetSection("bindings", section, sizeof(section), path);
+    char defaults_path[MAX_PATH];
+    settings::DefaultsPath(path, defaults_path, sizeof(defaults_path));
+    diag::Log("launch: psobbvr d3d8 build %s (compiled %s %s); ini %s (%s), %s (%s)",
+              PSOBBVR_GIT_REV, __DATE__, __TIME__, path,
+              settings::FileExists(path) ? "present" : "absent - all defaults",
+              settings::kDefaultsName,
+              settings::FileExists(defaults_path) ? "present" : "MISSING");
     diag::Log("launch: [vr] enabled=%d backend=%s controllers=%d "
               "stick_locomotion=%d head_move=%d world_scale=%.2f eye_height_auto=%d "
               "eye_offset_m=%.2f hand_presence=%d ik_arms=%d hud_layer=%d hud_lock=%d "
-              "hud_follow=%.0f/%.2f/%.2f menu_lock=%d "
+              "hud_follow=%.0f/%.2f/%.2f menu %.0f menu_lock=%d "
               "allow_any_runtime=%d vr_fail_message=%d vr_fail_exit=%d; [bindings] %s",
               config.enabled ? 1 : 0, config.backend_openxr ? "openxr" : "openvr",
               config.controllers ? 1 : 0, config.stick_locomotion ? 1 : 0,
@@ -349,7 +370,8 @@ void LoadConfig() {
               config.hand_presence ? 1 : 0, config.ik_arms,
               config.hud_layer ? 1 : 0,
               config.hud_lock, config.hud_follow_deg, config.hud_follow_wait_s,
-              config.hud_follow_glide_s, config.menu_lock ? 1 : 0,
+              config.hud_follow_glide_s, config.hud_follow_menu_deg,
+              config.menu_lock ? 1 : 0,
               config.allow_any_runtime ? 1 : 0,
               config.vr_fail_message ? 1 : 0, config.vr_fail_exit ? 1 : 0,
               bind_n > 0 ? "section present" : "section absent (defaults)");

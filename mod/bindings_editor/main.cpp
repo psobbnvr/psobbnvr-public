@@ -10,8 +10,12 @@
 //   3. VR settings - selected psobbvr.ini keys, read by the mod at
 //      launch.
 //
-// Reads psobbvr.ini next to its exe unless a path is given on the
-// command line. Plain Win32, static CRT.
+// Shows each setting as the mod reads it: psobbvr.ini over
+// psobbvr-defaults.ini (psobbvr_settings.hpp). Save writes psobbvr.ini
+// only, and only what differs from the defaults, so a later release's
+// new defaults still reach every setting left alone. Uses the files next
+// to its exe unless a psobbvr.ini path is given on the command line.
+// Plain Win32, static CRT.
 
 #include <windows.h>
 #include <commctrl.h>
@@ -22,6 +26,7 @@
 #include <cstring>
 
 #include "psobbvr_bindings_core.hpp"
+#include "psobbvr_settings.hpp"
 #include "common/registry_seed.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -37,6 +42,8 @@ namespace {
 // ---------------------------------------------------------------- common
 
 char g_ini_path[MAX_PATH] = "";
+char g_defaults_path[MAX_PATH] = "";
+char g_tidy_note[256] = "";   // the startup tidy's result, shown once in the log
 HWND g_main = nullptr;
 HWND g_tab = nullptr;
 HWND g_log = nullptr;
@@ -217,12 +224,27 @@ void FillChoices(HWND combo) {
     }
 }
 
+// The [bindings] lines as the mod reads them (psobbvr.ini's, then the
+// defaults file's for actions psobbvr.ini leaves out).
 int ReadBindingsSection(char* buf, DWORD cap, const char** lines, int max_lines) {
-    const DWORD n = GetPrivateProfileSectionA("bindings", buf, cap, g_ini_path);
+    const DWORD n = settings::GetSection("bindings", buf, cap, g_ini_path);
     int nlines = 0;
     for (const char* p = buf; n > 0 && *p != '\0' && nlines < max_lines; p += strlen(p) + 1)
         lines[nlines++] = p;
     return nlines;
+}
+
+// The layout with nothing in psobbvr.ini: the defaults file's [bindings]
+// lines over the built-in defaults.
+void BuildDefaultTable(Table& t) {
+    static char buf[16384];
+    buf[0] = buf[1] = '\0';
+    const DWORD n = GetPrivateProfileSectionA("bindings", buf, sizeof(buf), g_defaults_path);
+    const char* lines[128];
+    int nlines = 0;
+    for (const char* p = buf; n > 0 && *p != '\0' && nlines < 128; p += strlen(p) + 1)
+        lines[nlines++] = p;
+    Build(lines, nlines, t, nullptr, nullptr);
 }
 
 void ShowTable(const Table& t) {
@@ -282,13 +304,20 @@ void BindingsSave() {
     Table t;
     BindingsCheck(t);
     // Write the EFFECTIVE table, one line per action; lines equal to the
-    // default are removed so the ini stays minimal.
+    // default are removed so psobbvr.ini holds only the player's changes.
+    if (!settings::EnsureUserFile(g_ini_path)) {
+        char msg[400];
+        snprintf(msg, sizeof(msg), "Could not create %s (error %lu). Is the folder read-only?",
+                 g_ini_path, GetLastError());
+        MessageBoxA(g_main, msg, "PSOBB VR Options", MB_ICONERROR);
+        return;
+    }
+    Table d;
+    BuildDefaultTable(d);
     int written = 0, removed = 0;
     for (int a = 0; a < kActionCount; a++) {
         char chords[256];
         ActionChordsText(t, a, chords, sizeof(chords));
-        Table d;
-        Build(nullptr, 0, d, nullptr, nullptr);
         char def[256];
         ActionChordsText(d, a, def, sizeof(def));
         if (_stricmp(chords, def) == 0) {
@@ -304,6 +333,9 @@ void BindingsSave() {
             return;
         }
     }
+    char rest[4] = "";
+    if (GetPrivateProfileSectionA("bindings", rest, sizeof(rest), g_ini_path) == 0)
+        WritePrivateProfileStringA("bindings", nullptr, nullptr, g_ini_path);
     ShowTable(t);
     char line[200];
     snprintf(line, sizeof(line), "Saved: %d custom line(s) written (%d action(s) at their default "
@@ -314,16 +346,16 @@ void BindingsSave() {
 
 void BindingsDefaults() {
     Table t;
-    Build(nullptr, 0, t, nullptr, nullptr);
+    BuildDefaultTable(t);
     ShowTable(t);
     ClearLog();
-    AppendLog("Defaults restored in the editor (the built-in layout) - not saved yet.");
+    AppendLog("Defaults restored in the editor (the shipped layout) - not saved yet.");
 }
 
-// Export / import: an update zip carries a full psobbvr.ini, so unzipping
-// it loses custom bindings. Export writes every action (defaults included)
-// under a [bindings] header; import runs it through the ini parser into
-// the editor and leaves the write to Save.
+// Export / import: carries a layout to another install or keeps a copy.
+// Export writes every action (defaults included) under a [bindings]
+// header; import runs it through the ini parser into the editor and
+// leaves the write to Save.
 void IniFolder(char* out, size_t cap) {
     snprintf(out, cap, "%s", g_ini_path);
     char* slash = strrchr(out, '\\');
@@ -495,7 +527,7 @@ HWND g_g_preset, g_g_shadow, g_g_enemy, g_g_map, g_g_clip, g_g_fog, g_g_advanced
 
 const char* GameKeyPath() {
     // Follow the ini: redirect=1 (default) means the mod's own key.
-    return GetPrivateProfileIntA("registry", "redirect", 1, g_ini_path) != 0
+    return settings::GetInt("registry", "redirect", 1, g_ini_path) != 0
                ? "Software\\psobbvr\\PSOBB" : "Software\\SonicTeam\\PSOBB";
 }
 
@@ -817,6 +849,8 @@ constexpr Knob kKnobs[] = {
     {"vr", "swing_indicator", "Swing timing indicator", K_BOOL, 0, 1, "1", nullptr,
      "A hexagon at the top of your view: green = a swing starts an attack, blue = a swing lands the next hit, "
      "grey = wait. The shrinking ring shows when it is due."},
+    {"vr", "hotkey_highlight", "Highlight readied hotkey", K_BOOL, 0, 1, "1", nullptr,
+     "Lights up the hotkey bar slot that a hotkey chord has readied, until your swing uses it."},
     {"vr", "attack_retarget", "Head-based combo targeting", K_BOOL, 0, 1, "1", nullptr,
      "On: each hit of a combo goes at the enemy you are looking at. Off: the whole combo stays on the first "
      "hit's enemy, as in the original game."},
@@ -884,18 +918,61 @@ int ChoiceIndexOf(const Knob& k, const char* value) {
     return -1;
 }
 
+void TrimRight(char* s) {
+    char* e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+}
+
+// The value the mod reads: psobbvr.ini, else the defaults file, else the
+// knob's built-in default.
 void ReadIniValue(const Knob& k, char* out, size_t cap) {
     if (k.type == K_RESOLUTION) {
         char w[32], h[32];
-        GetPrivateProfileStringA("render", "width", "2880", w, sizeof(w), g_ini_path);
-        GetPrivateProfileStringA("render", "height", "2160", h, sizeof(h), g_ini_path);
+        settings::GetString("render", "width", "2880", w, sizeof(w), g_ini_path);
+        settings::GetString("render", "height", "2160", h, sizeof(h), g_ini_path);
         snprintf(out, cap, "%sx%s", w, h);
         return;
     }
-    GetPrivateProfileStringA(k.section, k.key, k.def, out, (DWORD)cap, g_ini_path);
-    // trim
-    char* e = out + strlen(out);
-    while (e > out && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+    settings::GetString(k.section, k.key, k.def, out, (DWORD)cap, g_ini_path);
+    TrimRight(out);
+}
+
+// The value with nothing in psobbvr.ini: the defaults file's, else the
+// knob's built-in default.
+void KnobDefault(const Knob& k, char* out, size_t cap) {
+    if (k.type == K_RESOLUTION) {
+        char w[32], h[32];
+        GetPrivateProfileStringA("render", "width", "2880", w, sizeof(w), g_defaults_path);
+        GetPrivateProfileStringA("render", "height", "2160", h, sizeof(h), g_defaults_path);
+        snprintf(out, cap, "%sx%s", w, h);
+        return;
+    }
+    GetPrivateProfileStringA(k.section, k.key, k.def, out, (DWORD)cap, g_defaults_path);
+    TrimRight(out);
+}
+
+// Set (value) or remove (nullptr) one psobbvr.ini line, leaving the file
+// untouched when it already says that. A section left empty goes too.
+bool WriteUserValue(const char* section, const char* key, const char* value) {
+    const bool has = settings::Has(section, key, g_ini_path);
+    if (value == nullptr && !has)
+        return true;
+    if (value == nullptr) {
+        if (!WritePrivateProfileStringA(section, key, nullptr, g_ini_path))
+            return false;
+        char rest[4] = "";
+        if (GetPrivateProfileSectionA(section, rest, sizeof(rest), g_ini_path) == 0)
+            WritePrivateProfileStringA(section, nullptr, nullptr, g_ini_path);
+        return true;
+    }
+    if (has) {
+        char cur[64];
+        GetPrivateProfileStringA(section, key, "", cur, sizeof(cur), g_ini_path);
+        TrimRight(cur);
+        if (strcmp(cur, value) == 0)
+            return true;
+    }
+    return WritePrivateProfileStringA(section, key, value, g_ini_path) != 0;
 }
 
 void KnobShow(int i, const char* value) {
@@ -972,7 +1049,7 @@ void VrLoad(bool announce) {
     char status[400];
     snprintf(status, sizeof(status), "%s  -  VR settings loaded.", g_ini_path);
     SetStatus(status);
-    if (announce) AppendLog("VR settings loaded from psobbvr.ini. Click a field to see what it does.");
+    if (announce) AppendLog("VR settings loaded. Click a field to see what it does.");
 }
 
 void VrSave() {
@@ -992,29 +1069,34 @@ void VrSave() {
         SetStatus("Not saved: a value is out of range.");
         return;
     }
+    if (!settings::EnsureUserFile(g_ini_path)) {
+        char msg[400];
+        snprintf(msg, sizeof(msg), "Could not create %s (error %lu). Is the folder read-only?",
+                 g_ini_path, GetLastError());
+        MessageBoxA(g_main, msg, "PSOBB VR Options", MB_ICONERROR);
+        return;
+    }
     int written = 0;
     for (int i = 0; i < kKnobCount; i++) {
         const Knob& k = kKnobs[i];
-        char cur[64];
+        char cur[64], def[64];
         ReadIniValue(k, cur, sizeof(cur));
-        char mirror_cur[64] = "";
-        if (k.mirror_key)
-            GetPrivateProfileStringA(k.section, k.mirror_key, k.def, mirror_cur, sizeof(mirror_cur), g_ini_path);
-        // Unchanged: leave the line (and its comments) alone.
-        if (_stricmp(cur, values[i]) == 0 && (!k.mirror_key || _stricmp(mirror_cur, values[i]) == 0))
-            continue;
+        KnobDefault(k, def, sizeof(def));
+        // psobbvr.ini keeps a value only while it differs from the default,
+        // so a setting put back to its default follows later releases again.
+        const bool at_default = settings::SameValue(values[i], def);
         bool w;
         if (k.type == K_RESOLUTION) {
             char* x = strchr(values[i], 'x');
             if (!x) continue;
             *x = 0;
-            w = WritePrivateProfileStringA("render", "width", values[i], g_ini_path) &&
-                WritePrivateProfileStringA("render", "height", x + 1, g_ini_path);
+            w = WriteUserValue("render", "width", at_default ? nullptr : values[i]) &&
+                WriteUserValue("render", "height", at_default ? nullptr : x + 1);
             *x = 'x';
         } else {
-            w = WritePrivateProfileStringA(k.section, k.key, values[i], g_ini_path) != 0;
+            w = WriteUserValue(k.section, k.key, at_default ? nullptr : values[i]);
             if (w && k.mirror_key)
-                w = WritePrivateProfileStringA(k.section, k.mirror_key, values[i], g_ini_path) != 0;
+                w = WriteUserValue(k.section, k.mirror_key, at_default ? nullptr : values[i]);
         }
         if (!w) {
             char msg[400];
@@ -1023,14 +1105,17 @@ void VrSave() {
             MessageBoxA(g_main, msg, "PSOBB VR Options", MB_ICONERROR);
             return;
         }
+        if (settings::SameValue(cur, values[i]))
+            continue;
         char line[200];
-        snprintf(line, sizeof(line), "%s: %s -> %s", k.label, cur, values[i]);
+        snprintf(line, sizeof(line), "%s: %s -> %s%s", k.label, cur, values[i],
+                 at_default ? " (the default)" : "");
         AppendLog(line);
         written++;
     }
     char line[400];
     if (written == 0)
-        snprintf(line, sizeof(line), "Nothing changed - psobbvr.ini already holds these values.");
+        snprintf(line, sizeof(line), "Nothing changed - these values are already in use.");
     else
         snprintf(line, sizeof(line), "Saved %d setting(s) to psobbvr.ini. They take effect the next time "
                  "the game starts.", written);
@@ -1039,7 +1124,11 @@ void VrSave() {
 }
 
 void VrDefaults() {
-    for (int i = 0; i < kKnobCount; i++) KnobShow(i, kKnobs[i].def);
+    for (int i = 0; i < kKnobCount; i++) {
+        char def[64];
+        KnobDefault(kKnobs[i], def, sizeof(def));
+        KnobShow(i, def);
+    }
     ClearLog();
     AppendLog("Shipped defaults shown for every VR setting - not saved yet.");
 }
@@ -1232,7 +1321,12 @@ void LoadAllPages() {
     GameLoad(false);
     VrLoad(false);
     ClearLog();
-    AppendLog("Loaded: controller bindings and VR settings from psobbvr.ini, game options from the registry.");
+    AppendLog("Loaded: controller bindings and VR settings from psobbvr.ini and psobbvr-defaults.ini, "
+              "game options from the registry.");
+    if (g_tidy_note[0] != '\0') {
+        AppendLog(g_tidy_note);
+        g_tidy_note[0] = '\0';
+    }
 }
 
 // ------------------------------------------------------------ DPI + layout
@@ -1529,6 +1623,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_RELOAD: OnReload(); return 0;
         case ID_DEFAULTS: OnDefaults(); return 0;
         case ID_OPENINI:
+            settings::EnsureUserFile(g_ini_path);
             ShellExecuteA(wnd, "open", "notepad.exe", g_ini_path, nullptr, SW_SHOWNORMAL);
             return 0;
         case ID_EXPORT: BindingsExport(); return 0;
@@ -1589,13 +1684,17 @@ bool ResolveIniPath(const char* cmdline_in) {
         const size_t n = (size_t)(e - b) < MAX_PATH - 1 ? (size_t)(e - b) : MAX_PATH - 1;
         memcpy(g_ini_path, b, n);
         g_ini_path[n] = '\0';
-        if (n > 0) return GetFileAttributesA(g_ini_path) != INVALID_FILE_ATTRIBUTES;
     }
-    GetModuleFileNameA(nullptr, g_ini_path, MAX_PATH);
-    char* slash = strrchr(g_ini_path, '\\');
-    if (slash != nullptr) slash[1] = '\0';
-    strcat_s(g_ini_path, "psobbvr.ini");
-    return GetFileAttributesA(g_ini_path) != INVALID_FILE_ATTRIBUTES;
+    if (g_ini_path[0] == '\0') {
+        GetModuleFileNameA(nullptr, g_ini_path, MAX_PATH);
+        char* slash = strrchr(g_ini_path, '\\');
+        if (slash != nullptr) slash[1] = '\0';
+        strcat_s(g_ini_path, "psobbvr.ini");
+    }
+    settings::DefaultsPath(g_ini_path, g_defaults_path, sizeof(g_defaults_path));
+    // A fresh install has no psobbvr.ini until the first Save; the shipped
+    // defaults file says this is the mod's folder.
+    return settings::FileExists(g_ini_path) || settings::FileExists(g_defaults_path);
 }
 
 }  // namespace
@@ -1605,13 +1704,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
     if (!ResolveIniPath(cmdline)) {
-        char msg[600];
+        char msg[800];
         snprintf(msg, sizeof(msg),
-                 "psobbvr.ini was not found at\n%s\n\nPut this program in the game folder "
-                 "next to psobbvr.ini (or pass the ini path on the command line).", g_ini_path);
+                 "Neither psobbvr-defaults.ini nor psobbvr.ini was found at\n%s\n\nPut this "
+                 "program in the game folder with the rest of the VR mod's files (or pass the "
+                 "psobbvr.ini path on the command line).", g_defaults_path);
         MessageBoxA(nullptr, msg, "PSOBB VR Options", MB_ICONERROR);
         return 1;
     }
+    // An older full psobbvr.ini becomes a player file, as the mod would do
+    // at its next launch (psobbvr_settings.hpp).
+    const settings::TidyResult tidy = settings::Tidy(g_ini_path);
+    snprintf(g_tidy_note, sizeof(g_tidy_note), "%s", tidy.note);
     WNDCLASSA wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
