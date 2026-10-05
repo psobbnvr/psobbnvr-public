@@ -6,6 +6,8 @@
 //   [vr] stick_locomotion  - analog stick walking: direction and speed
 //                            from the left stick, facing turned only by
 //                            the right stick and head_move
+//   [vr] snap_turn_deg     - the right stick turns in steps, landed in
+//                            one tick through the facing target
 //   [vr] turn_speed_scale  - slower keyboard rotation
 //   [vr] back_strafe       - back input walks backwards (no 180 turn)
 //   [vr] side_turn         - turn-key-only input turns in place instead
@@ -173,6 +175,21 @@ inline float stick_raw_turn = 0.0f;    // right stick turn, -1..1
 inline bool strafe_mode = false;
 inline int strafe_face_target = 0;  // facing + turn step (+ hold/follow steps)
 
+// Snap turning ([vr] snap_turn_deg; requested by controller::OnFrame):
+// signed BAMS still to turn, the facing's sign. The input fill moves it
+// into the view (gamecam::snap_preview), then carries it in the next
+// tick's facing target, so the steer stubs land it in one tick, and only
+// where the smooth turn would work; during an attack it goes into the
+// attack hold instead (see the fill).
+inline int snap_pending_bams = 0;
+inline int snap_wait_ticks = 0;     // fills the preview has waited to land
+inline int snap_tick_bams = 0;      // the snap in this tick's facing target
+inline int snap_tick_target = 0;    // the facing it lands on (16-bit)
+// A previewed snap that has not landed after this many fills (keyboard
+// input held, or a state with no steering such as a knockdown) is dropped
+// rather than turning late.
+constexpr int SNAP_LAND_TICKS = 4;
+
 inline float Scale() {
     const float s = stick_turn_scale >= 0.0f ? stick_turn_scale
                                              : vrmod::config.turn_speed_scale;
@@ -184,6 +201,7 @@ constexpr uintptr_t VEL_X_OFFSET = 0x30C;    // velocity x (float)
 constexpr uintptr_t VEL_Z_OFFSET = 0x314;    // velocity z (float)
 constexpr uintptr_t DEST_X_OFFSET = 0x404;   // walk-to destination x (float)
 constexpr uintptr_t DEST_Z_OFFSET = 0x40C;   // walk-to destination z (float)
+constexpr uintptr_t MOVEDIR_OFFSET = 0x3FC;  // motion direction, bams int32
 constexpr uintptr_t TRACE_ENTITY_SPAN = 0x6C8;  // one read-guard for all fields
 
 constexpr bool TraceOn() { return false; }
@@ -352,6 +370,19 @@ inline void AbsorbFollowStep(int out) {
     gamecam::follow_pending_step = 0;
 }
 
+// Snap turning: when a stub hands the game the facing that carries this
+// tick's snap, the snap has landed: it moves out of the view's preview
+// into the facing, so the view does not move. Consumed once.
+inline void LandSnap(int out) {
+    if (snap_tick_bams == 0 || (out & 0xFFFF) != (snap_tick_target & 0xFFFF))
+        return;
+    gamecam::snap_preview = Wrap16(gamecam::snap_preview - snap_tick_bams);
+    const int deg = (int)lroundf(abs(snap_tick_bams) * (360.0f / 65536.0f));
+    diag::Log("snapturn: %d deg %s", deg,
+              deg >= 180 ? "around" : snap_tick_bams < 0 ? "right" : "left");
+    snap_tick_bams = 0;
+}
+
 // Standing in-place step: aim at A while reversing (pure back has no side
 // input and never gets here; diagonals rotate toward their side).
 inline int __cdecl StandStepStub(int cur, int tgt, int rate) {
@@ -367,6 +398,7 @@ inline int __cdecl StandStepStub(int cur, int tgt, int rate) {
     if (strafe_mode) {
         const int out = strafe_face_target & 0xFFFF;
         AbsorbFollowStep(out);
+        LandSnap(out);
         if (TraceOn())
             TraceStub((uintptr_t)_ReturnAddress(), cur, out, out, false);
         return out;
@@ -397,6 +429,7 @@ inline uint32_t __cdecl MovingTurnStub(uint32_t cur, uint32_t tgt) {
     if (strafe_mode) {
         const uint32_t out = (uint32_t)(strafe_face_target & 0xFFFF);
         AbsorbFollowStep((int)out);
+        LandSnap((int)out);
         if (TraceOn())
             TraceStub((uintptr_t)_ReturnAddress(), (int)cur, (int)out, (int)out, false);
         return out;
@@ -536,13 +569,88 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
             ? *reinterpret_cast<const int32_t*>(entity + gamecam::ENTITY_FACING_OFFSET)
             : 0;
     const bool resolved = patches_applied && cam != 0 && entity != 0;
+    // Head-directed walking's heading, camera-yaw style (look + 180): the
+    // look direction the takeover wrote into the camera. Not the camera's
+    // own heading [camera+0x94]: that is a per-tick copy of +0x194
+    // (0x004D3B9D), which the camera code eases toward the written camera,
+    // so after a snap it trails the turn for about a second.
+    const int head_yaw = gamecam::written_this_frame
+                             ? (gamecam::look_yaw_bams + 0x8000) & 0xFFFF
+                             : raw_yaw;
+
+    bool action_mode_ok = false, action_attacking = false;
+    if (resolved &&
+        diag::Accessible(entity + gamecam::ENTITY_ACTION_MODE_OFFSET, 2, false)) {
+        const short mode = *reinterpret_cast<const short*>(
+            entity + gamecam::ENTITY_ACTION_MODE_OFFSET);
+        action_mode_ok = true;
+        action_attacking = mode >= 5 && mode <= 8;  // 8 = a technique cast
+    }
+
+    // Snap turning, in two steps so the view and the body turn in the same
+    // drawn frame. This update runs after the frame's camera placement, so
+    // a facing changed here is drawn before the view can follow: a new
+    // snap goes into the view first (gamecam::snap_preview, from the next
+    // placement on) and lands in the facing on the next tick (snap_now,
+    // carried in the facing target; LandSnap takes it out of the preview
+    // as the stub hands it over). In an attack or cast the attack machine
+    // chases the facing toward its target every tick (0x7A8CB8 at the top
+    // of 0x00698FA8), so a facing change would be undone: the snap moves
+    // into the attack hold instead - the view stays turned and the hold's
+    // drain turns the body once the attack ends - or, without the hold,
+    // waits for the end. A preview that never lands is dropped and the
+    // view jumps back.
+    snap_tick_bams = 0;
+    int snap_now = 0;
+    const bool snap_ok = resolved && vrmod::config.stick_locomotion;
+    int32_t& preview = gamecam::snap_preview;
+    if (preview == 0) {
+        snap_wait_ticks = 0;
+    } else if (!snap_ok) {
+        preview = 0;
+        gamecam::snap_view = true;
+        snap_wait_ticks = 0;
+    } else if (action_attacking) {
+        // An attack started between the preview and its landing.
+        if (vrmod::config.attack_view_hold) {
+            gamecam::hold_offset = Wrap16(gamecam::hold_offset - preview);
+        } else {
+            snap_pending_bams = Wrap16(snap_pending_bams + preview);
+            gamecam::snap_view = true;
+        }
+        preview = 0;
+        snap_wait_ticks = 0;
+    } else if (++snap_wait_ticks > SNAP_LAND_TICKS) {
+        diag::Log("snapturn: dropped - the game did not take the turn (%s)",
+                  kb_had ? "keyboard input" : "no steering in this state");
+        preview = 0;
+        gamecam::snap_view = true;
+        snap_wait_ticks = 0;
+    } else if (!kb_had) {
+        snap_now = preview;
+    }
+    if (snap_pending_bams != 0) {
+        if (!snap_ok) {
+            snap_pending_bams = 0;
+        } else if (action_attacking && vrmod::config.attack_view_hold) {
+            gamecam::hold_offset = Wrap16(gamecam::hold_offset - snap_pending_bams);
+            gamecam::snap_view = true;
+            diag::Log("snapturn: %d deg during an attack - the view turns now, the body after it",
+                      (int)lroundf(abs(snap_pending_bams) * (360.0f / 65536.0f)));
+            snap_pending_bams = 0;
+        } else if (!action_attacking) {
+            preview = Wrap16(preview + snap_pending_bams);
+            gamecam::snap_view = true;
+            snap_pending_bams = 0;
+        }
+    }
 
     // Analog strafe injection: the direction always at full run magnitude
     // (no sub-threshold stutter); speed is scaled separately. Keyboard
     // wins.
     bool v2_injected = false;
     bool v2_turn_only = false;
-    if (vrmod::config.stick_locomotion && !kb_had && stick_raw_active) {
+    if (vrmod::config.stick_locomotion && !kb_had && (stick_raw_active || snap_now != 0)) {
         const float sx = stick_raw_side, sy = stick_raw_fwd;
         const float mag = sqrtf(sx * sx + sy * sy);
         if (mag > 0.001f) {
@@ -553,12 +661,16 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
             *fwd = (int16_t)lroundf(sy * inv);
             v2_injected = true;
             trace_src = "strafe";
-        } else if (stick_raw_turn != 0.0f) {
+        } else if (stick_raw_turn != 0.0f || snap_now != 0) {
             // Turn-only: a side input keeps the router alive and starts
             // nothing (StandStepStub); fwd stays exactly 0. Not while a
             // released walk is still stopping: that would drop the speed
             // scale and the tail would run at full speed. The wind-down
-            // below stops it first (with the turn still applied).
+            // below stops it first (with the turn still applied). A snap's
+            // side input points away from the snap: the stand steer starts
+            // a walk when the stub's facing equals its request, which lies
+            // a quarter turn toward the input side, and a 90 degree snap
+            // toward that side would land on it exactly.
             bool stopping = false;
             if (resolved && strafe_winddown_ticks > 0 &&
                 diag::Accessible(entity, TRACE_ENTITY_SPAN, false)) {
@@ -569,11 +681,13 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
                 stopping = wx * wx + wz * wz > 0.0025f;
             }
             if (!stopping) {
-                *side = (int16_t)(stick_raw_turn > 0.0f ? 128 : -128);
+                const bool side_pos =
+                    snap_now != 0 ? snap_now > 0 : stick_raw_turn > 0.0f;
+                *side = (int16_t)(side_pos ? 128 : -128);
                 *fwd = 0;
                 v2_injected = true;
                 v2_turn_only = true;
-                trace_src = "turn";
+                trace_src = snap_now != 0 ? "snap" : "turn";
             }
         }
     }
@@ -641,14 +755,6 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
     // out of the view via gamecam::follow_offset. Mode 2 has no drain.
     const int head_move = vrmod::config.stick_locomotion ? vrmod::config.head_move : 0;
     const bool body_follows_head = head_move == 2;
-    bool action_mode_ok = false, action_attacking = false;
-    if (resolved &&
-        diag::Accessible(entity + gamecam::ENTITY_ACTION_MODE_OFFSET, 2, false)) {
-        const short mode = *reinterpret_cast<const short*>(
-            entity + gamecam::ENTITY_ACTION_MODE_OFFSET);
-        action_mode_ok = true;
-        action_attacking = mode >= 5 && mode <= 8;  // 8 = a technique cast
-    }
     int hold_step = 0;
     bool hold_attacking = false;
     if (resolved && vrmod::config.attack_view_hold && gamecam::hold_offset != 0 &&
@@ -662,6 +768,11 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
             if (hold_step < -0x800) hold_step = -0x800;
         }
     }
+    // No drain on a snap's tick: the hold absorbs a facing change only up
+    // to the drain step and only against the offset's sign, so a snap the
+    // offset's way would carry this tick's step into the view with it.
+    if (snap_now != 0)
+        hold_step = 0;
     gamecam::hold_drain_pending = hold_step > 0 ? hold_step : -hold_step;
     // A stick turn toward the side the character already faces (same sign
     // as the offset) shrinks the offset instead, so the view comes round
@@ -688,9 +799,9 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
         // Hold the current facing plus the right-stick turn (a switch from
         // walking to turn-only passes through these ticks).
         const int wind_turn = hold_turn(StickTurnStepBams());
-        strafe_face_target = Wrap16(facing + wind_turn + hold_step);
+        strafe_face_target = Wrap16(facing + wind_turn + hold_step + snap_now);
         face_target_bams = strafe_face_target;
-        steer = head_move != 0 ? raw_yaw
+        steer = head_move != 0 ? head_yaw
                                : facing + 0x8000 - (hold_attacking ? 0 : gamecam::hold_offset);
         trace_src = "wind";
         // strafe_vel_scale carries over from the last movement tick.
@@ -735,7 +846,7 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
             strafe_entity = entity;
         }
 
-        // Facing target = facing + commanded turn step.
+        // Facing target = facing + commanded turn step (+ the snap).
         const int turn_step = StickTurnStepBams();
         const int turn_apply = hold_turn(turn_step);
         // head_move 2: on movement ticks outside an attack, chase the
@@ -745,7 +856,9 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
         // so it drains as the body re-follows the head.
         int follow_step = 0;
         if (body_follows_head && !v2_turn_only && !action_attacking) {
-            const int gap = Wrap16(raw_yaw - (facing + 0x8000));
+            // The heading already carries a snap landing this tick (its
+            // preview), so the gap is measured from the facing it lands on.
+            const int gap = Wrap16(head_yaw - (facing + snap_now + 0x8000));
             follow_step = gap / 2;
             if (follow_step == 0 && gap != 0)
                 follow_step = gap > 0 ? 1 : -1;
@@ -762,14 +875,14 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
             }
         }
         strafe_face_target =
-            Wrap16(facing + turn_apply + hold_step + follow_step);
+            Wrap16(facing + turn_apply + hold_step + follow_step + snap_now);
         face_target_bams = strafe_face_target;  // shows in the trace A= column
         gamecam::follow_pending_step = follow_step;
         gamecam::follow_pending_target = strafe_face_target & 0xFFFF;
         // Walk direction. Mode 0: facing-relative, less the attack hold,
         // so stick-forward is the view's forward while re-aligning.
-        // Modes 1 / 2: the camera yaw, so forward is where you look.
-        steer = head_move != 0 ? raw_yaw
+        // Modes 1 / 2: the look direction, so forward is where you look.
+        steer = head_move != 0 ? head_yaw
                                : facing + 0x8000 - (hold_attacking ? 0 : gamecam::hold_offset);
     } else {
     strafe_vel_scale = -1.0f;  // stock speeds outside strafe/wind-down
@@ -829,6 +942,40 @@ inline void __cdecl InputFillDetour(int16_t* side, int16_t* fwd) {
     }
     }  // end legacy (keyboard / stick-mix) path
 
+    if (snap_now != 0 && strafe_mode) {
+        snap_tick_bams = snap_now;
+        snap_tick_target = strafe_face_target & 0xFFFF;
+        // While moving, the walk turns with the snap at once. The game walks
+        // at a destination planted about 8 units ahead and plants the next
+        // one only on arrival, so the old heading would carry on for up to
+        // five ticks. The destination is turned about the feet by the snap
+        // (the distance left, and so the arrival, unchanged), with the
+        // motion direction and the velocity; first attempt only.
+        if (!v2_turn_only && snap_wait_ticks == 1 &&
+            diag::Accessible(entity, TRACE_ENTITY_SPAN, true)) {
+            const float a = snap_now * (6.2831853f / 65536.0f);
+            const float c = cosf(a), sn = sinf(a);
+            // A direction (x, z) = (sin, cos)(bams); turning it by a gives
+            // (x c + z s, z c - x s).
+            auto turn = [&](float& x, float& z) {
+                const float nx = x * c + z * sn;
+                z = z * c - x * sn;
+                x = nx;
+            };
+            const float fx = *reinterpret_cast<const float*>(entity + gamecam::ENTITY_POS_OFFSET);
+            const float fz = *reinterpret_cast<const float*>(entity + gamecam::ENTITY_POS_OFFSET + 8);
+            float* dx = reinterpret_cast<float*>(entity + DEST_X_OFFSET);
+            float* dz = reinterpret_cast<float*>(entity + DEST_Z_OFFSET);
+            float rx = *dx - fx, rz = *dz - fz;
+            turn(rx, rz);
+            *dx = fx + rx;
+            *dz = fz + rz;
+            turn(*reinterpret_cast<float*>(entity + VEL_X_OFFSET),
+                 *reinterpret_cast<float*>(entity + VEL_Z_OFFSET));
+            int32_t* dir = reinterpret_cast<int32_t*>(entity + MOVEDIR_OFFSET);
+            *dir = (*dir + snap_now) & 0xFFFF;
+        }
+    }
     g_steer_yaw = steer;
     MaintainSpeedScale(entity, scale);
 

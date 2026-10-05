@@ -2,6 +2,11 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.4.0-beta (2026-10-04)
+
+- Fixed a crash that occurred when enabling the server's Draw Distance patch.  Made small hook modifications to allow patch use.
+- Added snap turning.  psobbvr_options.exe > VR Settings > Turning > Snap 15/30/45/90 degrees.  Includes options to allow stick holding and 180 when stick is pushed down.
+
 ## 0.3.0-beta (2026-10-04)
 
 - Fixed hotkeys 5-8 (left grip + right stick flick) not being assignable in the Customize menu.

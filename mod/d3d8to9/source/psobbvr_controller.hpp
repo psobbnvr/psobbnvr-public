@@ -1342,6 +1342,56 @@ inline bool PaletteArrowArms(BYTE arrow, bool ctrl_swap,
 }
 
 
+// Snap turning ([vr] snap_turn_deg > 0, analog stick movement): a firm
+// sideways push of the right stick (past the flick threshold, on the
+// dominant axis) asks the movement module for one turn of snap_turn_deg,
+// and the stick must come back near the centre before the next - the
+// flick thresholds, so a push that starts with a hotkey-flick grip held,
+// or in a menu, never snaps. snap_turn_repeat: a push held firm snaps
+// again every snap_turn_repeat_s. A firm push down turns around
+// (snap_turn_around), in the field only - in menus it is Down.
+inline int snap_dir = 0;            // latched push: 1 right, -1 left, 2 down, 3 up
+inline bool snap_live = false;      // the latched push may turn
+inline LONGLONG snap_next_qpc = 0;  // when a held push repeats
+
+inline void SnapTurnPoll(bool on, bool turn_ok, bool field, float x, float y,
+                         float side_sign, LONGLONG now) {
+    const float ax = fabsf(x), ay = fabsf(y);
+    const float mag = ax > ay ? ax : ay;
+    if (snap_dir != 0 && mag < bindings::STICK_CENTER)
+        snap_dir = 0;
+    auto request = [](int bams) {
+        movement::snap_pending_bams =
+            movement::Wrap16(movement::snap_pending_bams + bams);
+    };
+    // Right is negative BAMS, as in movement::StickTurnStepBams.
+    const int step = (int)lroundf(vrmod::config.snap_turn_deg * (65536.0f / 360.0f));
+    const LONGLONG repeat =
+        (LONGLONG)(vrmod::config.snap_turn_repeat_s * (double)trig_qpf);
+    if (snap_dir == 0) {
+        if (mag < bindings::STICK_FIRM)
+            return;
+        snap_dir = ax > ay ? (x > 0.0f ? 1 : -1) : (y < 0.0f ? 2 : 3);
+        snap_live = on && turn_ok && (snap_dir != 2 || field);
+        if (!snap_live || snap_dir == 3)
+            return;
+        if (snap_dir == 2) {
+            if (vrmod::config.snap_turn_around)
+                request(0x8000);
+            return;
+        }
+        request((int)(-snap_dir * side_sign) * step);
+        snap_next_qpc = now + repeat;
+        return;
+    }
+    if (on && snap_live && turn_ok && vrmod::config.snap_turn_repeat &&
+        (snap_dir == 1 || snap_dir == -1) && ax >= bindings::STICK_FIRM &&
+        ax > ay && (x > 0.0f) == (snap_dir > 0) && now >= snap_next_qpc) {
+        request((int)(-snap_dir * side_sign) * step);
+        snap_next_qpc = now + repeat;
+    }
+}
+
 // Called every frame from BeginScene, before movement::OnFrame so the
 // turn-rate scale is set when it refreshes the rate. gameplay_drives =
 // the camera takeover is driving this frame.
@@ -1721,6 +1771,10 @@ inline void OnFrame(bool gameplay_drives) {
         else if (!quick_menu && fabsf(rxr) >= 0.6f && fabsf(rxr) > fabsf(ry))
             add(rxr > 0 ? K_RIGHT : K_LEFT);
     }
+    // Snap turning replaces the right stick's turn rate.
+    const bool snap_mode =
+        vrmod::config.stick_locomotion && vrmod::config.snap_turn_deg > 0.0f;
+    SnapTurnPoll(snap_mode, turn_ok, !menu_mode, rxr, ry, side_sign, tq.QuadPart);
 
     if (vrmod::config.stick_locomotion) {
         // Publish the raw stick state; the movement module's input
@@ -1735,11 +1789,12 @@ inline void OnFrame(bool gameplay_drives) {
             ms = mx * (t / mmag);
             mf = my * (t / mmag);
         }
+        const float turn = snap_mode ? 0.0f : rx;
         movement::stick_raw_side = side_sign * ms;
         movement::stick_raw_fwd = -mf;
-        movement::stick_raw_turn = side_sign * rx;
+        movement::stick_raw_turn = side_sign * turn;
         movement::stick_raw_active =
-            ms != 0.0f || mf != 0.0f || rx != 0.0f;
+            ms != 0.0f || mf != 0.0f || turn != 0.0f;
         movement::stick_move_active = false;
     } else {
         movement::stick_raw_active = false;

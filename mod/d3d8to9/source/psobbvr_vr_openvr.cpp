@@ -118,6 +118,10 @@ void LoadConfig() {
         config.controller_side_sign = -1.0f;
     config.stick_locomotion = settings::GetInt("vr", "stick_locomotion", 1, path) != 0;
     read_float("stick_turn_deg_s", 9.9f, 360.001f, config.stick_turn_deg_s);
+    read_float("snap_turn_deg", -0.001f, 180.001f, config.snap_turn_deg);
+    config.snap_turn_repeat = settings::GetInt("vr", "snap_turn_repeat", 0, path) != 0;
+    read_float("snap_turn_repeat_s", 0.099f, 3.001f, config.snap_turn_repeat_s);
+    config.snap_turn_around = settings::GetInt("vr", "snap_turn_around", 1, path) != 0;
     read_float("stick_speed_floor", 0.009f, 1.001f, config.stick_speed_floor);
     const int head_move = settings::GetInt("vr", "head_move", 0, path);
     if (head_move >= 0 && head_move <= 2)

@@ -130,8 +130,8 @@ game menu or dialog is showing.
 | Control | Normal play | Menu open |
 |---|---|---|
 | Left stick | walk (light push walks, full push runs) | walk |
-| Right stick left / right | smooth turn | left / right |
-| Right stick up / down | — | up / down |
+| Right stick left / right | turn (smooth, or snap steps if set in the Options program) | left / right |
+| Right stick up / down | down: turn around (snap turning only) | up / down |
 | Right trigger | attack / bottom palette slot (with a melee weapon it arms the attack and your swing performs it) | confirm |
 | Left trigger | left palette slot (heavy attack / item / technique) | back |
 | Both triggers | right palette slot (special attack) | — |
@@ -225,7 +225,7 @@ three pages:
   they display incorrectly in VR.
 - **VR settings:** resolution per eye (lower it if the headset
   stutters), eye height, HUD position and height, HUD and menu distance and size,
-  terrain draw distance, turn speed, stick deadzone, hand and weapon
+  terrain draw distance, smooth or snap turning, turn speed, stick deadzone, hand and weapon
   size, IK arms (experimental: your character's whole arms reach for
   the controllers), the swing and casting options, vibration. Click a
   setting to read what it does.

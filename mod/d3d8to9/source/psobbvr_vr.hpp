@@ -164,6 +164,16 @@ struct Config {
     // Max smooth-turn rate at full right-stick deflection, deg/s (squared
     // curve below).
     float stick_turn_deg_s = 140.0f;
+    // Snap turning (stick_locomotion only): 0 = smooth turning at
+    // stick_turn_deg_s; otherwise each firm sideways push of the right
+    // stick turns this many degrees at once (psobbvr_controller.hpp
+    // SnapTurnPoll, psobbvr_movement.hpp). snap_turn_repeat keeps snapping
+    // every snap_turn_repeat_s while the stick stays pushed;
+    // snap_turn_around makes a firm push down turn 180 degrees.
+    float snap_turn_deg = 0.0f;
+    bool snap_turn_repeat = false;
+    float snap_turn_repeat_s = 0.5f;
+    bool snap_turn_around = true;
     // Speed scale at the lightest walk deflection (curve: floor +
     // (1-floor)*d^2).
     float stick_speed_floor = 0.15f;
@@ -231,8 +241,9 @@ struct Config {
     // The same in town (floor id 0, Pioneer 2), where culling is the perf
     // cost and nothing needs it wide. 0 = no override.
     float cull_fov_scale_town = 0.7f;
-    // Scale on the game's environment draw distance (per-episode clip
-    // multipliers, psobbvr_drawdist.hpp). >1 = further; 1 (or 0) = stock.
+    // Scale on the game's environment draw distance (the clip multipliers
+    // behind the Clip Distance setting, psobbvr_drawdist.hpp). >1 =
+    // further; 1 (or 0) = stock.
     float draw_distance_scale = 4.0f;
     // Route the game's per-object screen-edge visibility tests through its
     // distance-only path while the takeover drives (psobbvr_objvis.hpp),

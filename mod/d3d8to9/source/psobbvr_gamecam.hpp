@@ -205,7 +205,9 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
 // (BAMS) and the view follows facing - hold_offset. Afterwards
 // movement.hpp turns the character back in capped steps, reported in
 // hold_drain_pending so the hold absorbs only those and stick turns
-// still move the view. Recenter zeroes it.
+// still move the view. A snap turn during an attack is taken out of it, so
+// the view turns at once and the drain turns the body after. Recenter
+// zeroes it.
 constexpr uintptr_t ENTITY_ACTION_MODE_OFFSET = 0x32E;  // short: 5..7 = attack
 inline int32_t hold_offset = 0;
 inline int32_t hold_prev_facing = 0;
@@ -224,6 +226,22 @@ inline int32_t hold_drain_pending = 0;  // |BAMS| movement commanded this tick
 inline int32_t follow_offset = 0;
 inline int32_t follow_pending_step = 0;    // signed BAMS commanded this tick
 inline int32_t follow_pending_target = 0;  // the facing it lands on (16-bit)
+
+// Snap turning (movement.hpp): a snap turns the view a tick before the
+// body - the game's update runs after this frame's placement, so a facing
+// changed there is drawn a frame before the view could follow. snap_preview
+// (BAMS, the facing's sign) is a snap shown in the view but not yet in the
+// facing; it joins the view target and moves into the facing when the
+// snap lands. snap_view: the next Apply takes the yaw follow straight to
+// its target instead of easing there (a preview starting or dropped, or
+// the attack hold taking a snap). Consumed by that Apply.
+inline int32_t snap_preview = 0;
+inline bool snap_view = false;
+
+// The look direction Apply writes into the camera, as a facing-style BAMS
+// angle (direction (sin, cos)); valid while written_this_frame.
+// Head-directed walking steers by it (movement.hpp).
+inline int32_t look_yaw_bams = 0;
 
 // Run lean: smoothed feet movement drives a forward camera offset, as the
 // run animation leans the head forward and would show the torso.
@@ -582,18 +600,22 @@ inline void Apply() {
             }
             hold_was_attacking = attacking;
         }
-        // The view's target: facing - hold_offset - follow_offset.
+        // The view's target: facing - hold_offset - follow_offset, plus a
+        // snap not yet landed.
         const int32_t view_off =
-            (vrmod::config.attack_view_hold ? hold_offset : 0) + follow_offset;
+            (vrmod::config.attack_view_hold ? hold_offset : 0) + follow_offset -
+            snap_preview;
         if (view_off != 0) {
             const float t_theta =
                 (live_bams - view_off) * (6.2831853f / 65536.0f);
             target_fx = sinf(t_theta);
             target_fz = cosf(t_theta);
         }
-        if (warming) {  // snap: a late placement turn lands at once
+        // Jump: a late placement turn, or a snap turn, lands at once.
+        if (warming || snap_view) {
             follow_dx = target_fx;
             follow_dz = target_fz;
+            snap_view = false;
         } else {
             follow_dx += (target_fx - follow_dx) * FOLLOW_ALPHA;
             follow_dz += (target_fz - follow_dz) * FOLLOW_ALPHA;
@@ -723,6 +745,7 @@ inline void Apply() {
         }
     }
     const float scale = TARGET_DISTANCE / sqrtf(fx * fx + fy * fy + fz * fz);
+    look_yaw_bams = (int32_t)lroundf(atan2f(fx, fz) * (32768.0f / 3.14159265f)) & 0xFFFF;
 
     cam[0] = world_from_head._41;
     cam[1] = world_from_head._42;

@@ -9,8 +9,10 @@
 //   0x007BA638  (float far_limit, float radius, float arg3) ret 0xC
 // Both transform into the internal camera's view space (0x835C3C), reject
 // behind-camera and beyond far_limit, then project (0x82F09C) and test the
-// screen edges (right <= [0xA48A4C] + margin [0x9ACB68]). The hooks keep
-// only the range test (see InRange). The special paths
+// screen edges (right <= [0xA48A4C] + margin [0x9ACB68]). The hooks pass
+// an object that is in range (see InRange) or that the original passes:
+// the original carries any draw distance extension a server patch writes
+// into it (newserv's DrawDistance multiplies far_limit). The special paths
 // (flag bit 0x400 at this+8, and [0xA16380]==1 = reuse the cached answer)
 // defer to the original. psobbvr_cullfov.hpp does not cover these.
 //
@@ -52,7 +54,15 @@ constexpr uintptr_t ONSCREEN_TEST_B = 0x007BA638;  // 3-arg screen test
 // The object base class's on-screen virtual (inherited by the floor-item
 // and equipment family). Same shape as A but pure: returns 0/1, no cached
 // flag, no special paths. The held weapon's path.
+//
+// Hooked by swapping its vtable slots, not with a code jump: it has no
+// direct callers, only vtable slots in the image's data, and newserv's
+// DrawDistance patch writes a CALL at 0x5C5267, three bytes in, which
+// would land inside a 5-byte jump at its entry.
 constexpr uintptr_t ONSCREEN_TEST_C = 0x005C5264;
+// The game's code range; a vtable slot's neighbours point into it.
+constexpr uintptr_t GAME_TEXT_BEGIN = 0x00401000;
+constexpr uintptr_t GAME_TEXT_END = 0x008CC000;
 // Its raw-position entry, straight into the core at 0x5C528C:
 // cdecl(pos*, far, radius). The mag's draw gate (0x5DCFA4) calls it with
 // [this+0x20]+0x300, far 400, radius 20 and skips the draw on a miss.
@@ -73,7 +83,9 @@ using TestBFn = int(__fastcall*)(void* self, void* edx,
 
 inline TestAFn original_a = nullptr;
 inline TestBFn original_b = nullptr;
-inline TestAFn original_c = nullptr;  // same (far_limit, radius) shape as A
+// Same (far_limit, radius) shape as A; the function itself stays untouched.
+inline TestAFn original_c = reinterpret_cast<TestAFn>(ONSCREEN_TEST_C);
+inline int c_slots_swapped = 0;
 using TestDFn = int(__cdecl*)(const float* pos, float far_limit, float radius);
 inline TestDFn original_d = nullptr;
 
@@ -115,10 +127,17 @@ inline int InRangeOnly(void* self, float far_limit, float radius) {
     return vis;
 }
 
+// The original runs only for objects beyond our range, where a patched
+// far_limit can still pass them; the cached word then holds the OR.
 inline int __fastcall HookA(void* self, void* edx, float far_limit, float radius) {
     if (!WantsOverride(self))
         return original_a(self, edx, far_limit, radius);
-    return InRangeOnly(self, far_limit, radius);
+    if (InRangeOnly(self, far_limit, radius))
+        return 1;
+    const int vis = original_a(self, edx, far_limit, radius) ? 1 : 0;
+    *reinterpret_cast<uint16_t*>(reinterpret_cast<uintptr_t>(self) + OBJ_VISIBLE_OFFSET) =
+        static_cast<uint16_t>(vis);
+    return vis;
 }
 
 inline int __fastcall HookB(void* self, void* edx, float far_limit, float radius, float arg3) {
@@ -134,7 +153,52 @@ inline int __fastcall HookC(void* self, void* edx, float far_limit, float radius
         return original_c(self, edx, far_limit, radius);
     const auto* pos =
         reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(self) + OBJ_POS_OFFSET);
-    return InRange(pos, far_limit, radius);
+    if (InRange(pos, far_limit, radius))
+        return 1;
+    return original_c(self, edx, far_limit, radius) ? 1 : 0;
+}
+
+// Points every vtable slot holding ONSCREEN_TEST_C at HookC. A slot is
+// taken only when both neighbours are game code pointers too, so a stray
+// data word with the same value is left alone.
+inline int SwapVtableSlotsC() {
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    const auto code_ptr_at = [](uintptr_t addr) {
+        if (!diag::Accessible(addr, 4, false))
+            return false;
+        const uint32_t v = *reinterpret_cast<const uint32_t*>(addr);
+        return v >= GAME_TEXT_BEGIN && v < GAME_TEXT_END;
+    };
+    const auto hook = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&HookC));
+    int swapped = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+            (sec->Characteristics & IMAGE_SCN_MEM_READ) == 0)
+            continue;
+        const uintptr_t begin = base + sec->VirtualAddress;
+        const uintptr_t end = begin + (sec->Misc.VirtualSize & ~3u);
+        for (uintptr_t page = begin; page < end; page += 0x1000) {
+            if (!diag::Accessible(page, 0x1000, false))
+                continue;
+            const uintptr_t page_end = page + 0x1000 < end ? page + 0x1000 : end;
+            for (uintptr_t a = page; a < page_end; a += 4) {
+                auto* slot = reinterpret_cast<uint32_t*>(a);
+                if (*slot != ONSCREEN_TEST_C || a == begin || !code_ptr_at(a - 4) ||
+                    !code_ptr_at(a + 4))
+                    continue;
+                DWORD old_protect;
+                if (!VirtualProtect(slot, 4, PAGE_READWRITE, &old_protect))
+                    continue;
+                *slot = hook;
+                VirtualProtect(slot, 4, old_protect, &old_protect);
+                swapped++;
+            }
+        }
+    }
+    return swapped;
 }
 
 // The raw-position entry (the mag's path): plain cdecl, pure.
@@ -273,9 +337,6 @@ inline void Install() {
         MH_CreateHook(reinterpret_cast<void*>(ONSCREEN_TEST_B),
                       reinterpret_cast<void*>(&HookB),
                       reinterpret_cast<void**>(&original_b)) != MH_OK ||
-        MH_CreateHook(reinterpret_cast<void*>(ONSCREEN_TEST_C),
-                      reinterpret_cast<void*>(&HookC),
-                      reinterpret_cast<void**>(&original_c)) != MH_OK ||
         MH_CreateHook(reinterpret_cast<void*>(ONSCREEN_TEST_D),
                       reinterpret_cast<void*>(&HookD),
                       reinterpret_cast<void**>(&original_d)) != MH_OK ||
@@ -287,15 +348,17 @@ inline void Install() {
     }
     if (MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_A)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_B)) != MH_OK ||
-        MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_C)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_D)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(MAG_UPDATE)) != MH_OK) {
         diag::Log("objvis: MH_EnableHook failed");
         return;
     }
-    probe::Log("objvis: on-screen test hooks installed at 0x%08X / 0x%08X / 0x%08X / 0x%08X",
+    c_slots_swapped = SwapVtableSlotsC();
+    diag::Log("objvis: on-screen test 0x%08X hooked in %d vtable slots",
+              (unsigned)ONSCREEN_TEST_C, c_slots_swapped);
+    probe::Log("objvis: on-screen test hooks installed at 0x%08X / 0x%08X / 0x%08X",
                (unsigned)ONSCREEN_TEST_A, (unsigned)ONSCREEN_TEST_B,
-               (unsigned)ONSCREEN_TEST_C, (unsigned)ONSCREEN_TEST_D);
+               (unsigned)ONSCREEN_TEST_D);
 }
 
 }  // namespace objvis

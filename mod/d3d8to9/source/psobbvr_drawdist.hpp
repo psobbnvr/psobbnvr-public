@@ -3,9 +3,11 @@
 // Extends the level geometry draw distance ([vr] draw_distance_scale).
 // Two parts:
 //
-//  1. Clip distance. Per-episode multipliers in .data (0x97F1C0 = 1.0f
-//     Ep1/fallback, 0x97F1B8 = 1.5f Ep2, 0x97F1BC = 2.0f Ep4; episode word
-//     0xA46C6A, getter 0x482A30) feed the area-setup builder 0x807448
+//  1. Clip distance. One multiplier per Clip Distance setting in .data
+//     (0x97F1C0 = 1.0f Near/fallback, 0x97F1B8 = 1.5f Mid, 0x97F1BC = 2.0f
+//     Far; the setting word 0xA46C6A, getter 0x482A30, is GRAPHICCTRL
+//     dword 5 clamped to 0..2 by the settings loader at 0x482C10) feed
+//     the area-setup builder 0x807448
 //     (world-render context in EAX; cdecl pre-entry 0x807444), run at area
 //     load from 0x8072E0 / 0x80B865: base distances at 0x97F1A8..B4
 //     (0.5 / 1200 / 800 / 600) x multiplier -> a per-area table from the
@@ -47,12 +49,13 @@
 
 namespace drawdist {
 
-// Per-episode clip-distance multipliers and their stock values.
+// Clip-distance multipliers, one per Clip Distance setting, and their
+// stock values.
 struct Multiplier { uintptr_t addr; float stock; };
 constexpr Multiplier MULTIPLIERS[] = {
-    { 0x0097F1C0, 1.0f },  // Ep1 + fallback
-    { 0x0097F1B8, 1.5f },  // Ep2
-    { 0x0097F1BC, 2.0f },  // Ep4
+    { 0x0097F1C0, 1.0f },  // Near + fallback
+    { 0x0097F1B8, 1.5f },  // Mid
+    { 0x0097F1BC, 2.0f },  // Far
 };
 
 // The world-render context pointer the area-setup builder takes.

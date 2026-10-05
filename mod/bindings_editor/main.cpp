@@ -819,8 +819,17 @@ constexpr Knob kKnobs[] = {
      "Multiplies how far the level's terrain is drawn. Enemies, NPCs, items and boxes keep the game's own "
      "limits. Higher values cost performance in town."},
     // --- Movement
+    {"vr", "snap_turn_deg", "Turning", K_CHOICE, 0, 0, "0",
+     "Smooth=0|Snap 15 degrees=15|Snap 30 degrees=30|Snap 45 degrees=45|Snap 90 degrees=90",
+     "Smooth: the right stick turns you gradually. Snap: each push of the right stick turns you a fixed "
+     "step at once, which many people find more comfortable in VR."},
     {"vr", "stick_turn_deg_s", "Turn speed (degrees/s)", K_INT, 30, 360, "140", nullptr,
-     "How fast the right stick turns you when pushed all the way."},
+     "Smooth turning: how fast the right stick turns you when pushed all the way."},
+    {"vr", "snap_turn_repeat", "Keep snapping while held", K_BOOL, 0, 1, "0", nullptr,
+     "Snap turning: holding the right stick to one side keeps turning you, a step every half second. "
+     "Off: one step per push."},
+    {"vr", "snap_turn_around", "Stick down turns around", K_BOOL, 0, 1, "1", nullptr,
+     "Snap turning: pushing the right stick down turns you around (180 degrees)."},
     {"vr", "controller_deadzone", "Stick deadzone", K_FLOAT, 0, 0.6, "0.15", nullptr,
      "How far a stick must move before it counts. Raise it if your character drifts on its own."},
     {"vr", "controller_press", "Trigger/grip press point", K_FLOAT, 0.2, 0.95, "0.6", nullptr,
@@ -882,7 +891,7 @@ constexpr int KnobIndex(const char* key) {
 }
 // First knob of each group, found by its key so adding a row cannot move
 // a group boundary. The first two groups share the left column.
-constexpr int kGroupStarts[] = {0, KnobIndex("stick_turn_deg_s"), KnobIndex("hand_presence"),
+constexpr int kGroupStarts[] = {0, KnobIndex("snap_turn_deg"), KnobIndex("hand_presence"),
                                 KnobIndex("enabled")};
 const char* kGroupNames[] = {"Comfort and view", "Movement", "Hands and combat", "Troubleshooting"};
 constexpr int kGroupCount = sizeof(kGroupStarts) / sizeof(kGroupStarts[0]);
@@ -1039,6 +1048,17 @@ bool KnobCollect(int i, char* out, size_t cap, char* err, size_t ecap) {
     }
 }
 
+// Turn speed applies only to smooth turning and the snap rows only to snap
+// turning: grey out whichever the Turning choice shown leaves unused.
+void VrSyncTurning() {
+    char v[64], err[200];
+    const bool snap = KnobCollect(KnobIndex("snap_turn_deg"), v, sizeof(v), err, sizeof(err)) &&
+                      atof(v) > 0.0;
+    EnableWindow(g_knob[KnobIndex("stick_turn_deg_s")], !snap);
+    EnableWindow(g_knob[KnobIndex("snap_turn_repeat")], snap);
+    EnableWindow(g_knob[KnobIndex("snap_turn_around")], snap);
+}
+
 void VrLoad(bool announce) {
     ClearLog();
     for (int i = 0; i < kKnobCount; i++) {
@@ -1046,6 +1066,7 @@ void VrLoad(bool announce) {
         ReadIniValue(kKnobs[i], v, sizeof(v));
         KnobShow(i, v);
     }
+    VrSyncTurning();
     char status[400];
     snprintf(status, sizeof(status), "%s  -  VR settings loaded.", g_ini_path);
     SetStatus(status);
@@ -1129,6 +1150,7 @@ void VrDefaults() {
         KnobDefault(kKnobs[i], def, sizeof(def));
         KnobShow(i, def);
     }
+    VrSyncTurning();
     ClearLog();
     AppendLog("Shipped defaults shown for every VR setting - not saved yet.");
 }
@@ -1636,6 +1658,8 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id >= ID_VR_FIRST && id < ID_VR_FIRST + kKnobCount) {
+            if (id == ID_VR_FIRST + KnobIndex("snap_turn_deg") && code == CBN_SELCHANGE)
+                VrSyncTurning();
             // Focus on any VR control shows its explanation.
             if (code == EN_SETFOCUS || code == CBN_SETFOCUS || code == BN_SETFOCUS) {
                 const Knob& k = kKnobs[id - ID_VR_FIRST];
