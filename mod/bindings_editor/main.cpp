@@ -783,6 +783,7 @@ struct Knob {
     const char* choices;      // K_CHOICE: "label=value|label=value"
     const char* desc;         // shown in the status line while focused
     const char* mirror_key;   // a second key saved with the same value
+    const char* tip;          // an information icon's hover text, or nullptr
 };
 
 // The settings shown; everything else stays ini-only. The mod reads them
@@ -818,6 +819,10 @@ constexpr Knob kKnobs[] = {
     {"vr", "draw_distance_scale", "Terrain draw distance", K_FLOAT, 0.25, 16, "4", nullptr,
      "Multiplies how far the level's terrain is drawn. Enemies, NPCs, items and boxes keep the game's own "
      "limits. Higher values cost performance in town."},
+    {"vr", "box_fade", "Enhanced box draw distance", K_BOOL, 0, 1, "1", nullptr,
+     "Boxes and other containers stay drawn further away instead of fading out at the game's short "
+     "distance. Only works when the server's \"Draw Distance\" patch is enabled.",
+     nullptr, "Only works when the server's \"Draw Distance\" patch is enabled"},
     // --- Movement
     {"vr", "snap_turn_deg", "Turning", K_CHOICE, 0, 0, "0",
      "Smooth=0|Snap 15 degrees=15|Snap 30 degrees=30|Snap 45 degrees=45|Snap 90 degrees=90",
@@ -847,6 +852,8 @@ constexpr Knob kKnobs[] = {
      "Size of your hands and held weapon. 1 = the game's original (oversized) models.", "hand_scale"},
     {"vr", "hand_pitch_deg", "Hand angle (degrees)", K_FLOAT, -45, 45, "-10", nullptr,
      "Tilts the hands on the controllers. Negative points the fingers down."},
+    {"vr", "weapon_trail", "Weapon photon trail", K_BOOL, 0, 1, "1", nullptr,
+     "Melee weapons leave their photon trail behind a fast swing of your hand."},
     {"vr", "swing_attack", "Swing to attack", K_BOOL, 0, 2, "2", nullptr,
      "On: swing to attack. For heavy and special attacks, press their button, then swing. "
      "Off: attacks fire on the button press."},
@@ -1155,6 +1162,87 @@ void VrDefaults() {
     AppendLog("Shipped defaults shown for every VR setting - not saved yet.");
 }
 
+// Information icons: the system "i" after a setting's text, its tooltip
+// shown while the mouse is over it. The image is reloaded at each scale.
+constexpr int kInfoIconMax = 8;
+struct InfoIcon { HWND wnd = nullptr; HICON image = nullptr; };
+InfoIcon g_info_icons[kInfoIconMax];
+int g_info_icon_count = 0;
+HWND g_vr_tips = nullptr;
+
+HICON LoadInfoImage() {
+    HICON image = nullptr;
+    LoadIconWithScaleDown(nullptr, MAKEINTRESOURCEW(32516) /* IDI_INFORMATION */, S(16), S(16),
+                          &image);
+    return image;
+}
+
+void ReloadInfoImages() {
+    for (int i = 0; i < g_info_icon_count; i++) {
+        const HICON image = LoadInfoImage();
+        SendMessageA(g_info_icons[i].wnd, STM_SETICON, (WPARAM)image, 0);
+        if (g_info_icons[i].image != nullptr)
+            DestroyIcon(g_info_icons[i].image);
+        g_info_icons[i].image = image;
+    }
+    if (g_vr_tips != nullptr)
+        SendMessageA(g_vr_tips, TTM_SETMAXTIPWIDTH, 0, S(360));
+}
+
+// Width of a control's text in its font, in device pixels.
+int TextWidth(HWND ctl, const char* text) {
+    const HDC dc = GetDC(ctl);
+    const HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageA(ctl, WM_GETFONT, 0, 0));
+    SIZE size = {};
+    GetTextExtentPoint32A(dc, text, (int)strlen(text), &size);
+    SelectObject(dc, old);
+    ReleaseDC(ctl, dc);
+    return size.cx;
+}
+
+// An information icon just after the text of ctl (a checkbox, trimmed to
+// its text, or a label), with the tip on hover.
+void AddInfoIcon(HWND page, HWND ctl, bool checkbox, const char* text, const char* tip) {
+    if (ctl == nullptr || g_info_icon_count >= kInfoIconMax)
+        return;
+    RECT r;
+    GetWindowRect(ctl, &r);
+    MapWindowPoints(nullptr, page, reinterpret_cast<POINT*>(&r), 2);
+    int text_right = r.left + TextWidth(ctl, text);
+    if (checkbox) {
+        SIZE ideal = {};
+        SendMessageA(ctl, BCM_GETIDEALSIZE, 0, (LPARAM)&ideal);
+        const int w = ideal.cx > 0 ? ideal.cx : S(18) + TextWidth(ctl, text);
+        SetWindowPos(ctl, nullptr, 0, 0, w, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
+        text_right = r.left + w;
+    }
+    const int size = S(16);
+    const HWND icon = CreateWindowExA(0, "STATIC", nullptr,
+                                      WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE | SS_NOTIFY,
+                                      text_right + S(6), r.top + (r.bottom - r.top - size) / 2,
+                                      size, size, page, nullptr, nullptr, nullptr);
+    InfoIcon& slot = g_info_icons[g_info_icon_count++];
+    slot.wnd = icon;
+    slot.image = LoadInfoImage();
+    SendMessageA(icon, STM_SETICON, (WPARAM)slot.image, 0);
+    if (g_vr_tips == nullptr) {
+        g_vr_tips = CreateWindowExA(WS_EX_TOPMOST, TOOLTIPS_CLASSA, nullptr,
+                                    WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                    CW_USEDEFAULT, page, nullptr, nullptr, nullptr);
+        SendMessageA(g_vr_tips, TTM_SETMAXTIPWIDTH, 0, S(360));
+        SendMessageA(g_vr_tips, TTM_SETDELAYTIME, TTDT_INITIAL, 100);
+        SendMessageA(g_vr_tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+    }
+    TOOLINFOA ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = page;
+    ti.uId = (UINT_PTR)icon;
+    ti.lpszText = (LPSTR)tip;
+    SendMessageA(g_vr_tips, TTM_ADDTOOLA, 0, (LPARAM)&ti);
+}
+
 int BuildVrPage(HWND page) {
     int y = MARGIN;
     MakeLabel(page, "The mod's settings, saved in psobbvr.ini. Click a setting to see what it does in the "
@@ -1180,13 +1268,14 @@ int BuildVrPage(HWND page) {
         const int yy = col_y[col];
         const int id = ID_VR_FIRST + i;
         const char* label = k.label;
+        HWND label_ctl = nullptr;
         switch (k.type) {
         case K_BOOL:
             g_knob[i] = MakeCheck(page, label, id, x0, yy + 1, LBL + CTL);
             break;
         case K_CHOICE:
         case K_RESOLUTION: {
-            MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
+            label_ctl = MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
             const int n = ChoiceCount(k);
             g_knob[i] = MakeDropList(page, id, x0 + LBL, yy, COL_W - LBL - 16, nullptr, 0);
             for (int c = 0; c < n; c++) {
@@ -1197,13 +1286,19 @@ int BuildVrPage(HWND page) {
             break;
         }
         default: {
-            MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
+            label_ctl = MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
             g_knob[i] = MakeEdit(page, id, x0 + LBL, yy, CTL - 30);
             char rng[64];
             snprintf(rng, sizeof(rng), "%g..%g  (default %s)", k.min, k.max, k.def);
             MakeLabel(page, rng, x0 + LBL + CTL - 24, yy + 4, COL_W - LBL - CTL + 20, 18, g_font);
             break;
         }
+        }
+        if (k.tip != nullptr) {
+            if (k.type == K_BOOL)
+                AddInfoIcon(page, g_knob[i], true, label, k.tip);
+            else
+                AddInfoIcon(page, label_ctl, false, label, k.tip);
         }
         col_y[col] += ROW;
     }
@@ -1570,6 +1665,7 @@ void Rescale(int from_dpi) {
     for (int i = 0; i < PAGE_COUNT; i++) g_page_content[i] = MulDiv(g_page_content[i], g_dpi, from_dpi);
     for (int n = 0; n < kComboNoteCount; n++)
         if (g_notes[n].tip) SendMessageA(g_notes[n].tip, TTM_SETMAXTIPWIDTH, 0, S(360));
+    ReloadInfoImages();
     DeleteObject(c.old_font);
     DeleteObject(c.old_bold);
     DeleteObject(c.old_mono);

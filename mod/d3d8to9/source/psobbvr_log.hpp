@@ -113,6 +113,12 @@ inline bool gun_ray_relog_request = false;
 inline bool bindings_dump = false;
 inline bool bindings_reload = false;
 inline unsigned bodycull_applied = 0;
+// Photon trail samples kept / dropped by the real-hand trail, since launch
+// and in the last pass (weapongrip HookTrailAdd).
+inline unsigned trail_kept_total = 0;
+inline unsigned trail_dropped_total = 0;
+inline int trail_kept_last_pass = 0;
+inline int trail_dropped_last_pass = 0;
 inline int menutrace_frames = 0;
 inline bool menutrace_full = false;
 // The controller's menu mode this frame (a menu, prompt or non-gameplay

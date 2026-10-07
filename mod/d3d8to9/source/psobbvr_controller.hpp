@@ -287,15 +287,16 @@ inline int sw_gap_frames = 0;    // forced-release calls after the press
 inline BYTE sw_fire_key = 0;     // the key being synthesized
 
 // The left hand's swing counts with a twin weapon (one half per hand):
-// daggers, knuckles and twin swords, by the same kind rules the twin
-// weapon split uses. A double saber is one staff and stays right-hand.
-// [vr] swing_left_hand.
+// daggers, knuckles, twin swords and the other weapons drawn once per
+// hand, by the same rules the twin weapon split uses, and any weapon seen
+// drawing an off-hand half (Panther's Claw, Heart of Poumn). A double
+// saber is one staff and stays right-hand. [vr] swing_left_hand.
 inline bool LeftSwingActive() {
     return vrmod::config.swing_left_hand &&
            weapongrip::current_weapon != nullptr &&
            !weapongrip::current_is_gun &&
-           (weapongrip::KindSplitsFunnel(weapongrip::current_kind) ||
-            weapongrip::KindSplitsComposite(weapongrip::current_kind));
+           (weapongrip::current_twin_funnel || weapongrip::current_twin_comp ||
+            weapongrip::draws_left_half);
 }
 
 inline void SwingSample(int hand, const vrmod::ControllerState& cs,

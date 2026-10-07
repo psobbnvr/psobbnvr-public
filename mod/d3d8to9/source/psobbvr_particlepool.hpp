@@ -3,12 +3,19 @@
 //
 // The game has 108 fixed particle pools (one per record of the 40-byte
 // table at 0xA101C0; pool pointers at 0xAAEE20, built at startup by
-// 0x8013BC). Two draw methods (thiscall on the pool) issue one projected
-// screen quad per particle through the 2D drawer 0x82B440:
-//   0x801DF8  vtable 0xB473B8 slot 2 - untextured additive quads (site
-//             0x802015: footstep dust, the telepipe beam and sparkles)
-//   0x802114  vtable 0xB473F0 slot 2 - textured alpha quads (site
-//             0x802412: Forest grass)
+// 0x8013BC, which picks the pool class from record +0x24). Two draw
+// methods (thiscall on the pool) issue one projected screen quad per
+// particle:
+//   0x801DF8  vtable 0xB473B8 slot 2 (class 3) - quads through the 2D
+//             drawer 0x82B440 (site 0x802015: footstep dust, the
+//             telepipe beam and sparkles)
+//   0x802114  vtable 0xB473F0 slot 2 (class 4) - rotated quads through
+//             0x82BB74 (site 0x802412: Forest grass)
+// Both bind the pool's texture (record +0x08, an index into the effect
+// sheet) and take the blend from the record's flags (+0x00): none =
+// SRCALPHA/ONE (0x7A902C), 2 = SRCALPHA/INVSRCALPHA (0x7A9044), 4 =
+// INVDESTCOLOR/INVSRCCOLOR (0x7A905C), 2|4 = INVDESTCOLOR/INVSRCALPHA
+// (0x7A9074).
 // The hooks publish the pool index during the draw, so the world-sprite
 // route can treat a pool's quads by identity ([vr] sprite_upright_pools)
 // and the census can name the pool.

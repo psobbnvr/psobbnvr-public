@@ -24,7 +24,10 @@
 // TObjCamera 0x64394C, ...). The held weapon and the mag use the
 // base-class virtual and its raw-position entry (C and D below).
 //
-// [vr] object_vis_fix.
+// Boxes and other containers also fade out by distance after their
+// on-screen test passes (HookBoxFade below).
+//
+// [vr] object_vis_fix, box_fade.
 #pragma once
 
 #include <cstdint>
@@ -73,6 +76,19 @@ constexpr uintptr_t OBJ_FLAGS_OFFSET = 0x08;       // word; bit 0x400 = distance
 constexpr uintptr_t OBJ_POS_OFFSET = 0x38;         // world x,y,z floats
 constexpr uintptr_t OBJ_VISIBLE_OFFSET = 0x1E;     // cached result word
 
+// The containers' distance fade. The 18 container classes (boxes and the
+// like) share the draw 0x64D840: their on-screen virtual with the
+// object's own range (+0x33C, 400 for the Forest box), then this test on
+// a fade record embedded at +0x348 (thiscall(pos*), ret 4). It marks the
+// object far when the squared horizontal distance from the camera
+// ([0xA48A54]+0x178) reaches the square of the record's fade distance
+// (+0x1C; 300 for the Forest box, the record's own default), and the
+// per-frame update 0x61132C then fades it out. newserv's DrawDistance
+// patch multiplies the on-screen ranges, not this. One other class (draw
+// 0x65E8B8) uses the same record.
+constexpr uintptr_t FADE_TEST = 0x006113A0;
+constexpr uintptr_t FADE_DISTANCE_OFFSET = 0x1C;
+
 using TransformFn = void(__cdecl*)(const float* pos, float* out);
 // __fastcall matches the game's thiscall + callee-cleaned stack floats
 // (edx is unused garbage).
@@ -88,6 +104,8 @@ inline TestAFn original_c = reinterpret_cast<TestAFn>(ONSCREEN_TEST_C);
 inline int c_slots_swapped = 0;
 using TestDFn = int(__cdecl*)(const float* pos, float far_limit, float radius);
 inline TestDFn original_d = nullptr;
+using FadeTestFn = int(__fastcall*)(void* record, void* edx, const float* pos);
+inline FadeTestFn original_fade = nullptr;
 
 // True when the main path should be overridden; the special early paths
 // (distance-only family, cache-reuse mode) always defer to the original.
@@ -319,6 +337,22 @@ inline void __fastcall HookMagUpdate(void* self, void* edx) {
     }
 }
 
+// The fade test with the record's fade distance times box_fade_scale.
+// The record keeps its own value: the scaled one is in place only for
+// the call.
+inline int __fastcall HookBoxFade(void* record, void* edx, const float* pos) {
+    const float scale = vrmod::config.box_fade_scale;
+    if (!vrmod::config.box_fade || scale == 1.0f)
+        return original_fade(record, edx, pos);
+    float* const fade =
+        reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(record) + FADE_DISTANCE_OFFSET);
+    const float saved = *fade;
+    *fade = saved * scale;
+    const int visible = original_fade(record, edx, pos);
+    *fade = saved;
+    return visible;
+}
+
 // Called from the first BeginScene, next to textsnap::Install.
 inline void Install() {
     static bool tried = false;
@@ -340,6 +374,9 @@ inline void Install() {
         MH_CreateHook(reinterpret_cast<void*>(ONSCREEN_TEST_D),
                       reinterpret_cast<void*>(&HookD),
                       reinterpret_cast<void**>(&original_d)) != MH_OK ||
+        MH_CreateHook(reinterpret_cast<void*>(FADE_TEST),
+                      reinterpret_cast<void*>(&HookBoxFade),
+                      reinterpret_cast<void**>(&original_fade)) != MH_OK ||
         MH_CreateHook(reinterpret_cast<void*>(MAG_UPDATE),
                       reinterpret_cast<void*>(&HookMagUpdate),
                       reinterpret_cast<void**>(&original_mag_update)) != MH_OK) {
@@ -349,6 +386,7 @@ inline void Install() {
     if (MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_A)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_B)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(ONSCREEN_TEST_D)) != MH_OK ||
+        MH_EnableHook(reinterpret_cast<void*>(FADE_TEST)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(MAG_UPDATE)) != MH_OK) {
         diag::Log("objvis: MH_EnableHook failed");
         return;
@@ -356,6 +394,9 @@ inline void Install() {
     c_slots_swapped = SwapVtableSlotsC();
     diag::Log("objvis: on-screen test 0x%08X hooked in %d vtable slots",
               (unsigned)ONSCREEN_TEST_C, c_slots_swapped);
+    diag::Log("objvis: box fade test 0x%08X hooked (box_fade=%d x%.2f)",
+              (unsigned)FADE_TEST, vrmod::config.box_fade ? 1 : 0,
+              vrmod::config.box_fade_scale);
     probe::Log("objvis: on-screen test hooks installed at 0x%08X / 0x%08X / 0x%08X",
                (unsigned)ONSCREEN_TEST_A, (unsigned)ONSCREEN_TEST_B,
                (unsigned)ONSCREEN_TEST_D);

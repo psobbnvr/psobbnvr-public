@@ -69,7 +69,8 @@ struct Config {
     // layer only. With head_move 2, mode 1 follows the head's yaw through a
     // dead zone instead (hud_follow_*, gamecam::HudGazeFollow); while a
     // menu is open the zone is hud_follow_menu_deg, so the eyes can roam
-    // over the menu without the HUD gliding away.
+    // over the menu without the HUD gliding away (a moving HUD keeps the
+    // same zone around where it is heading).
     int hud_lock = 1;
     float hud_follow_deg = 10.0f;
     float hud_follow_menu_deg = 30.0f;
@@ -251,6 +252,13 @@ struct Config {
     // box behind the wearer keeps its visible flag (the box react handler
     // consults it, e.g. for a Zonde lock).
     bool object_vis_fix = true;
+    // Boxes and other containers fade out beyond a fade distance of their
+    // own (300 for the Forest box), shorter than their on-screen range, and
+    // a server's draw distance patch does not reach it
+    // (psobbvr_objvis.hpp HookBoxFade). The test uses that distance times
+    // box_fade_scale; box_fade 0 = the game's distance.
+    bool box_fade = true;
+    float box_fade_scale = 2.0f;
     // Hold the mag for the one tick its bone target glitches on a
     // look-back (psobbvr_objvis.hpp HookMagUpdate).
     bool mag_glitch_fix = true;
@@ -562,6 +570,11 @@ struct Config {
     // dropped rather than sent to the HUD, where a near fog puff would
     // darken the whole HUD.
     float alpha_sprite_floor = 1.0f;
+    // Particle-pool quads in the game's inverse-colour blends (src
+    // INVDESTCOLOR; the pools 54..107) take the world route too, under the
+    // alpha sprites' floor. Neither rule above admits them, and on the HUD
+    // their textures' opaque black squares show. false = off.
+    bool pool_sprite_rule = true;
     // Upright world sprites: the world route plants each effect quad
     // square to the view direction, so a tall sprite for a vertical thing
     // (the telepipe beam) leans with head pitch. Such quads are rebuilt
@@ -614,6 +627,14 @@ struct Config {
     // are oversized for third person). 1 = authored size. Boxed passes and
     // the animation-riding fallback keep the authored size.
     float weapon_scale = 0.7f;
+    // Photon swing trails from the real hand (weapongrip TRAIL_ADD): the
+    // game's own trail, its points moved onto the re-seated weapon and
+    // kept on any fast swing. 0 = the local weapon's trails are hidden
+    // (the game builds them along the hidden arm).
+    bool weapon_trail = true;
+    // Blade speed in room space (m/s) that starts a trail; it stops below
+    // half of it.
+    float weapon_trail_speed = 2.0f;
     float grip_pitch_deg = 0.0f;
     float grip_roll_deg = 180.0f;
     float grip_yaw_deg = 0.0f;
@@ -624,15 +645,15 @@ struct Config {
     float gun_yaw_deg = 0.0f;
     float gun_fwd_cm = 5.0f;
     float gun_up_cm = 0.0f;
-    // Fist trim: a delta (grip axes; zero = the game's placement) for a
-    // weapon attached to the fist bone instead of the hand bone (claws,
-    // weapongrip::seat_on_fist). side_cm = along the palm normal.
-    float fist_pitch_deg = -40.0f;
+    // Fist trim: a delta (grip axes; zero = the neutral-pose placement) for
+    // a weapon attached to another bone than the hand (the claws' forearm
+    // mount, weapongrip::seat_on_fist). side_cm = along the palm normal.
+    float fist_pitch_deg = 0.0f;
     float fist_roll_deg = 0.0f;
     float fist_yaw_deg = 0.0f;
-    float fist_fwd_cm = 11.0f;
-    float fist_up_cm = -12.0f;
-    float fist_side_cm = -1.0f;
+    float fist_fwd_cm = 3.0f;
+    float fist_up_cm = 0.0f;
+    float fist_side_cm = 1.5f;
     // Developer-build one-shot pass count for the part census
     // (psobbvr_partmap.hpp).
     int partmap_request = 0;

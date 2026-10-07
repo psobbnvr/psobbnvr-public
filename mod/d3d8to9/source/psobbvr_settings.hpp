@@ -162,6 +162,10 @@ inline constexpr OldDefault kOldDefaults[] = {
     {"vr", "swing_indicator", "0", "hud_lock"},
     {"vr", "swing_indicator_y", "48", "hud_lock"},
     {"vr", "grip_pitch_deg", "-10", "hud_height_deg"},
+    {"vr", "fist_pitch_deg", "-40", "weapon_trail"},
+    {"vr", "fist_fwd_cm", "11", "weapon_trail"},
+    {"vr", "fist_up_cm", "-12", "weapon_trail"},
+    {"vr", "fist_side_cm", "-1", "weapon_trail"},
 };
 
 // Settings earlier releases shipped that the defaults file no longer

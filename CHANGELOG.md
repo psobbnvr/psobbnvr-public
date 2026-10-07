@@ -2,6 +2,16 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.5.0-beta (2026-10-06)
+
+- Fixed photon trails on weapons not appearing.
+- Corrected claw-class weapon hand placement.
+- Fixed Phoenix Claw not appearing.
+- Fixed certain two-piece weapons that weren't appearing in both hands.
+- Tweaked HUD movement when head-based locomotion is enabled and HUD placement is set to *In front of your character*.
+- Added an option to extend the box draw distance when the server's *Draw Distance* patch is enabled.
+- Fixed alpha channel and draw area issues for multiple particle sprites.
+
 ## 0.4.0-beta (2026-10-04)
 
 - Fixed a crash that occurred when enabling the server's Draw Distance patch.  Made small hook modifications to allow patch use.

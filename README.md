@@ -225,9 +225,9 @@ three pages:
   they display incorrectly in VR.
 - **VR settings:** resolution per eye (lower it if the headset
   stutters), eye height, HUD position and height, HUD and menu distance and size,
-  terrain draw distance, smooth or snap turning, turn speed, stick deadzone, hand and weapon
+  terrain and box draw distance, smooth or snap turning, turn speed, stick deadzone, hand and weapon
   size, IK arms (experimental: your character's whole arms reach for
-  the controllers), the swing and casting options, vibration. Click a
+  the controllers), weapon photon trail, the swing and casting options, vibration. Click a
   setting to read what it does.
 
 Game options and VR settings take effect the next time the game starts.

@@ -92,6 +92,50 @@ inline uint8_t KindOfCategory(uint8_t category) {
     return category < sizeof(WEAPON_KIND_TABLE) ? WEAPON_KIND_TABLE[category]
                                                 : WEAPON_KIND_NONE;
 }
+// Weapons whose shape follows the attack state. Each tick the weapon update
+// 0x5E7DEC reads the owner's attack state (0x5E7F6C) and calls the class
+// virtual +0xD0 (attacking) or +0xD4 (not attacking). Most classes leave
+// both as the no-op 0x61CDB0; the rest move their own fields past the
+// 0x240-byte base object toward an attack and an idle value (Blade Dance's
+// blade extension, Slicer of Assassin's fold and length, claws opening,
+// parasols, spinning parts), which their draw turns into the shape. The
+// trail endpoints are authored for the attack shape.
+constexpr uintptr_t WEAPON_VT_ATTACKING = 0xD0;
+constexpr uintptr_t WEAPON_VT_IDLE = 0xD4;
+constexpr uintptr_t WEAPON_VT_NOOP = 0x0061CDB0;
+constexpr uintptr_t WEAPON_VARIANT_OFFSET = 0xF4;   // item data[2]
+// Whether an item of a class with its own attacking / idle pair changes
+// shape. Most pairs act on every item; these act on some (each pair's
+// condition, keyed on its attacking virtual):
+inline bool PairReshapes(uintptr_t attacking_fn, uint8_t category, uint8_t variant) {
+    switch (attacking_fn) {
+    case 0x005EC534:  // daggers: variants 5 and 8 (Blade Dance, Zero Divide)
+        return variant == 5 || variant == 8;
+    case 0x005FA15C:  // partisans: category 4 variant 5 (Brionac)
+        return category == 0x04 && variant == 5;
+    case 0x005FD594:  // slicers: category 5 variants 5 and 7
+        return category == 0x05 && (variant == 5 || variant == 7);
+    case 0x005FB2A8:  // rifles: category 7 variant 5
+        return category == 0x07 && variant == 5;
+    case 0x005ECF44:  // wands: variant 7
+        return variant == 7;
+    case 0x00600F6C:  // canes: category 0x0A variant 5 (+0x244 there is a
+                      // once-per-attack sound latch, not shape)
+        return category == 0x0A && variant == 5;
+    case 0x005FE864:  // category 0x14 variant 2 (its motion speed)
+        return category == 0x14 && variant == 2;
+    case 0x005EAF7C:  // category 0x8B: every variant but 3
+        return variant != 3;
+    default:
+        return true;
+    }
+}
+// The weapon object's flags (+0x1DC): bit 0x400 = the held draw 0x5E8088
+// takes its two-pass path, drawing the model on bone 48 and again on bone
+// 35 (set by the class ctor: daggers, G-Assassin's Sabers, S-Beat's and
+// S-Red's Blade, Lavis Blade, Twin Chakram ...): one half per hand.
+constexpr uintptr_t WEAPON_FLAGS_OFFSET = 0x1DC;
+constexpr uint32_t WEAPON_FLAG_TWO_PASS = 0x400;
 inline bool KindIsGun(uint8_t kind) {
     return kind == WEAPON_KIND_HANDGUN || kind == WEAPON_KIND_RIFLE ||
            kind == WEAPON_KIND_MECHGUN || kind == WEAPON_KIND_SHOT ||
@@ -99,10 +143,11 @@ inline bool KindIsGun(uint8_t kind) {
 }
 // Which kinds are two-handers. Single-hand weapons with animated parts
 // (slicers, claws, double sabers) drift like an off-hand half, so the
-// split is gated by kind. Funnel duals (both halves in one bracket):
-// daggers and knuckles. Composite duals (one half per bracket): mechguns
-// and twin swords (e.g. Musashi 0x89, G-Assassin's Sabers 0xA0, Jizai
-// 0xB8, S-rank SWORDS 0xA5, TypeSS 0xE7).
+// funnel split is gated by kind. Funnel duals (both halves in one
+// bracket): daggers and knuckles. Mechguns and twin swords (e.g. Musashi
+// 0x89, Jizai 0xB8, TypeSS 0xE7) draw one half per composite bracket; the
+// attach bone assigns those (IsLeftArmBone), and this kind test gates the
+// left hand's swing.
 inline bool KindSplitsFunnel(uint8_t kind) {
     return kind == WEAPON_KIND_DAGGER || kind == WEAPON_KIND_KNUCKLE;
 }
@@ -138,25 +183,47 @@ inline bool IsKnownFiringOverride(uintptr_t ov) {
             return true;
     return false;
 }
-// Photon-trail suppression: swing trails follow the game's arm animation,
-// so with the weapon re-seated they would streak along the old path. They
-// render (via the untextured-strip helper 0x82B284, world-space vertices)
-// through two thiscall routines:
-//  - 0x5E9B9C: the trail object's render (vtable 0xB10330; the weapon
-//    holds its trail objects in slots +0x1B0..+0x1BC; [this+0x28] bit 1
-//    is the class's own skip)
-//  - 0x5D0774: a fixed 10-segment ribbon from an inline buffer at
-//    this+0xC4
-// Suppressed only while the local weapon is re-seated.
-constexpr uintptr_t TRAIL_RENDER_A = 0x005E9B9C;
-constexpr uintptr_t TRAIL_RENDER_B = 0x005D0774;
+// Photon swing trails. The weapon holds up to four trail objects in slots
+// +0x1B0..+0x1BC (vtable 0xB10330; 0x5E7648 creates one for each endpoint
+// byte +0x1C0+i that is not -1). Right after drawing the model, the held
+// draw 0x5E8088 and the per-slot helper 0x5E6254 (called by the class draw
+// overrides, twin swords 0x5F57AC among them) sample two points per slot
+// with 0x5E83C8 - a weapon node from the owner's node matrices
+// [entity+0xEBC], or the owner's hand bone - and pass them to the add
+// routine 0x5E9CB8 (thiscall on the trail object). Both sample sites run
+// only while the owner's action-state mask [entity+0x328] (1 << state,
+// written by 0x694390) has an attack-state bit (states 5-7). The trail
+// renders through 0x5E9B9C (untextured world-space strips, helper
+// 0x82B284), called per slot by 0x5E87EC.
+//
+// The sampled points come from the game's arm animation, which the
+// re-seat replaces, so the add hook moves them with the transform the
+// last re-seated part got, and keeps a sample only while the blade moves
+// fast in room space. To sample outside attacks as well, the owner's
+// action mask carries an attack bit while the sample sites run; the
+// model draw and everything after see the real value. A weapon whose
+// shape follows the attack state (PairReshapes) never gets it: its trail
+// shows during attacks only, as in the original game.
+constexpr uintptr_t TRAIL_RENDER = 0x005E9B9C;
+constexpr uintptr_t TRAIL_ADD = 0x005E9CB8;
+constexpr uintptr_t TRAIL_SLOT_SAMPLE = 0x005E6254;
 constexpr uintptr_t WEAPON_TRAIL_SLOT_FIRST = 0x1B0;
 constexpr int WEAPON_TRAIL_SLOT_COUNT = 4;
-// Composite weapons (twin swords, mechguns) draw through a second entry
-// into the held-model draw code, 0x5E84A8 (thiscall on the weapon
-// object). The twin-sword draw override (0x5F57AC) calls it once per
-// half: model [this+0xFC] (style 0x30), then the second model swapped in
-// from [this+0x1AC] (style 0x23) - first = main hand, second = off hand.
+// Trail object (ctor 0x5E9A70): +0x1C vertex buffer, +0x20 vertex count
+// (the add 0x5E9CB8 smooths from the newest pair while it is nonzero).
+constexpr uintptr_t TRAIL_VERTEX_COUNT_OFFSET = 0x20;
+constexpr uintptr_t WEAPON_OWNER_OFFSET = 0xF8;          // the owner entity
+constexpr uintptr_t ENTITY_ACTION_MASK_OFFSET = 0x328;
+constexpr uint32_t ACTION_MASK_ATTACKING = 0xE0;         // states 5-7
+constexpr uint32_t ACTION_MASK_ATTACK = 0x20;            // state 5
+// A trail stops when the blade slows below this share of
+// weapon_trail_speed.
+constexpr float TRAIL_STOP_RATIO = 0.5f;
+// Composite weapons (twin swords, mechguns and the other two-model
+// classes) draw through a second entry into the held-model draw code,
+// 0x5E84A8 (thiscall on the weapon object). The twin-sword draw override
+// (0x5F57AC) calls it once per half: model [this+0xFC] on bone 0x30 (48),
+// then the second model swapped in from [this+0x1AC] on bone 0x23 (35).
 constexpr uintptr_t WEAPON_COMP_DRAW = 0x005E84A8;
 // Twin split thresholds: a part's translation drift from its first-seen
 // position relative to the bracket root, in game units (same-hand parts
@@ -167,10 +234,13 @@ constexpr float TWIN_DEV_LOW = 0.015f;    // cluster membership at latch time
 constexpr int TWIN_SETTLE_BRACKETS = 16;  // extra brackets after the first cross
 
 using DrawFn = void(__fastcall*)(void* self, void* edx);
+using TrailAddFn = void(__fastcall*)(void* self, void* edx, float* a, float* b);
+using TrailSampleFn = void(__fastcall*)(void* self, void* edx, int slot);
 inline DrawFn original_draw = nullptr;
 inline DrawFn original_comp_draw = nullptr;
-inline DrawFn original_trail_a = nullptr;
-inline DrawFn original_trail_b = nullptr;
+inline DrawFn original_trail_render = nullptr;
+inline TrailAddFn original_trail_add = nullptr;
+inline TrailSampleFn original_trail_sample = nullptr;
 inline bool installed = false;
 
 // Per-pass state (reset in OnFrame).
@@ -179,7 +249,9 @@ inline uint8_t current_category = 0;    // weapon item data[1] (byte +0xF3)
 inline uint8_t current_kind = WEAPON_KIND_NONE;  // WEAPON_KIND_TABLE[category]
 inline bool current_is_gun = false;     // KindIsGun(current_kind)
 inline bool current_twin_funnel = false;  // the funnel learner may latch a split
-inline bool current_twin_comp = false;    // odd composite brackets are the off hand
+inline bool current_twin_comp = false;    // a mechgun or twin-sword kind
+inline uint8_t current_variant = 0;       // item data[2] (+0xF4), logged
+inline uintptr_t current_attacking_fn = 0;  // vtbl+0xD0, logged
 inline uint8_t current_projectile = 0;  // the PMT projectile byte (diagnostic)
 inline uintptr_t current_fire_override = 0;  // vtbl+0xCC of the weapon object
 // The swing gates' weapon test: a melee weapon, or bare hands with
@@ -193,7 +265,6 @@ inline void* logged_weapon = reinterpret_cast<void*>(~uintptr_t(0));  // last cl
 inline bool bracket_open = false;       // inside the weapon object's draw
 inline bool bracket_is_left = false;    // this bracket = the off-hand half
 inline bool bracket_learns = false;     // funnel bracket: twin-split learning runs
-inline int comp_ordinal = 0;            // composite brackets seen this pass
 inline bool have_grip = false;          // grip_world resolved this pass
 // The character's hand bone (the weapon seat and the hands' frame): the
 // entity's bone matrix array at entity+0xE0 (64 bytes per bone);
@@ -230,6 +301,7 @@ inline void RigidDelta(const D3DMATRIX& a, const D3DMATRIX& b, float& dist, floa
 inline D3DMATRIX bracket_root_raw = vrmod::Identity();
 inline bool have_bracket_root_raw = false;
 inline void* seat_logged_weapon = nullptr;   // one seat line per weapon
+inline void* seat_logged_left = nullptr;     // one off-hand seat line per weapon
 // An attach bone further than this from the first matrix is the wrong
 // bone for this model: seat on the first matrix instead.
 constexpr float SEAT_BONE_MAX_UNITS = 12.0f;
@@ -238,11 +310,11 @@ constexpr float SEAT_BONE_MAX_UNITS = 12.0f;
 // it at 0x5E8505 and parents the model to [owner+0xE0] + 64 * index (then,
 // if the index matches a byte at +0x210/+0x211, shifts by the vec3 at
 // +0x214/+0x220). 0x5E8088 forces bone 48 only on its photon-blade path
-// (flag [this+0x1DC] bit 0x400). Claws store the fist bone (the ctor
-// 0x5E959C sets 0x31 for the S-rank claws), which flexes against the hand
-// bone, so the seat uses this byte; a weapon off the hand bone is held at
-// the game's idle relation to it (fist rest lock) plus the fist_* trim,
-// which the hand mesh does not ride.
+// (flag [this+0x1DC] bit 0x400). Most claws store 0x31 (49), a mount on
+// the forearm (the ctor 0x5E959C sets it for the S-rank claws), so the
+// seat uses this byte; a weapon off the hand bone is held at that bone's
+// neutral-pose relation to the hand (NeutralRelation) plus the fist_*
+// trim, which the hand mesh does not ride.
 constexpr uintptr_t WEAPON_ATTACH_BONE_OFFSET = 0x189;
 inline int seat_attach_bone = -1;     // the attach bone at the last main-hand bracket
 inline bool seat_on_fist = false;     // that bone is not the hand bone
@@ -252,28 +324,196 @@ inline int ReadAttachBone() {
         return -1;
     return *reinterpret_cast<const int8_t*>(w + WEAPON_ATTACH_BONE_OFFSET);
 }
+// The shared skeleton's left arm is bones 26-37 (34 hand, 35 grip point,
+// 36 / 37 attachment points) and the right arm 39-50; each left bone is
+// its right mirror minus 13. Every draw of an off-hand half sets the
+// attach bone to a left-arm bone around that half's 0x5E84A8 call: most
+// class draws through 0x5E6334(35) (twin swords 0x5F57AC, Wok and
+// S-Berill's Hands 0x5EEEA8, Sacred Duster 0x5FCC54), Panther's Claw
+// 0x5EE3DC (34), Heart of Poumn 0x5F594C (36), the knuckles' 0x5F2EFC (the
+// stored bone minus 13), the mechguns' 0x5E74EC (35). A weapon stores 48
+// (the weapon slot's entry in the default table 0x9CB9AC) or 49 (the
+// S-rank claws' ctor), so a left-arm bone marks the off-hand half.
+constexpr int LEFT_ARM_BONE_FIRST = 26;
+constexpr int LEFT_ARM_BONE_LAST = 37;
+constexpr int MIRROR_BONE_OFFSET = 13;
+inline bool IsLeftArmBone(int bone) {
+    return bone >= LEFT_ARM_BONE_FIRST && bone <= LEFT_ARM_BONE_LAST;
+}
+// This weapon has drawn an off-hand half; reset on a weapon change.
+inline bool draws_left_half = false;
 inline D3DMATRIX grip_world = vrmod::Identity();  // grip_offset x hand-in-world
 // The same plus the fist_* trim, for a weapon on the fist bone.
 inline D3DMATRIX grip_world_fist = vrmod::Identity();
-// Fist rest lock: a claw is pinned
-// to the rigid VR hand at the game's idle relation between fist and hand
-// bone, instead of following the fist's flex. fist_rest = attach_bone x
-// inverse(hand_bone); the seat composes part x inverse(attach_bone) x
-// fist_rest x grip. Locks after FIST_LOCK_BRACKETS consecutive brackets
-// moving less than FIST_LOCK_DEG / FIST_LOCK_UNITS; the live relation is
-// used until then.
-constexpr int FIST_LOCK_BRACKETS = 30;
-constexpr float FIST_LOCK_DEG = 1.5f;
-constexpr float FIST_LOCK_UNITS = 0.1f;
-inline D3DMATRIX fist_rest = vrmod::Identity();
-inline bool fist_rest_locked = false;
-inline int fist_still_count = 0;
-inline D3DMATRIX fist_prev_delta = vrmod::Identity();
-inline bool have_fist_prev_delta = false;
-inline void ResetFistLock() {
-    fist_rest_locked = false;
-    fist_still_count = 0;
-    have_fist_prev_delta = false;
+// A weapon on another bone than the hand. Bone 49, the claws' bone, is a
+// mount on the forearm (child of the forearm bone 42 in the shared
+// skeleton; the hand bone 48 hangs off the wrist 44 / 45), so its live
+// relation to the hand changes with every wrist bend of the animation.
+// The seat uses the relation in the model's neutral pose instead: the body
+// tree [entity+0x34] walked in bone order (node, children, then siblings -
+// the order of the bone array [entity+0xE0]) and composed from each node's
+// stored transform. part x inverse(attach bone) x neutral(attach bone x
+// inverse(hand bone)) x grip places the weapon on the VR hand as on a
+// straight wrist, the same on every equip.
+constexpr uintptr_t ENTITY_TREE_OFFSET = 0x34;
+// Ninja object node: +0 eval flags (bit 0 = no translation, 1 = no
+// rotation, 2 = no scale, 0x20 = rotate Z, X, Y instead of X, Y, Z), +8
+// position f32[3], +0x14 angle i32[3] (65536 per turn), +0x20 scale
+// f32[3], +0x2C child, +0x30 sibling.
+constexpr uintptr_t NODE_SIZE = 0x34;
+constexpr int NEUTRAL_BONE_COUNT = 64;
+struct NeutralPose {
+    uintptr_t entity = 0, tree = 0;
+    int count = 0;                      // nodes walked
+    D3DMATRIX world[NEUTRAL_BONE_COUNT];
+    int parent[NEUTRAL_BONE_COUNT];
+};
+inline NeutralPose neutral;
+inline void* neutral_logged_weapon = nullptr;  // one check line per weapon
+// One node's local transform: scale, rotation (X, Y, Z or Z, X, Y), then
+// translation, row-vector like the game's matrix stack.
+inline D3DMATRIX NodeLocal(uintptr_t node) {
+    const uint32_t flags = *reinterpret_cast<const uint32_t*>(node);
+    const float* pos = reinterpret_cast<const float*>(node + 0x08);
+    const int32_t* ang = reinterpret_cast<const int32_t*>(node + 0x14);
+    const float* scl = reinterpret_cast<const float*>(node + 0x20);
+    D3DMATRIX m = vrmod::Identity();
+    if ((flags & 4) == 0) {
+        m._11 = scl[0];
+        m._22 = scl[1];
+        m._33 = scl[2];
+    }
+    if ((flags & 2) == 0) {
+        const float k = 2.0f * 3.14159265f / 65536.0f;
+        auto rot = [&](int axis) {
+            const float a = (float)ang[axis] * k, c = cosf(a), s = sinf(a);
+            D3DMATRIX r = vrmod::Identity();
+            if (axis == 0) {
+                r._22 = c; r._23 = s; r._32 = -s; r._33 = c;
+            } else if (axis == 1) {
+                r._11 = c; r._13 = -s; r._31 = s; r._33 = c;
+            } else {
+                r._11 = c; r._12 = s; r._21 = -s; r._22 = c;
+            }
+            m = vrmod::Multiply(m, r);
+        };
+        if ((flags & 0x20) != 0) {
+            rot(2); rot(0); rot(1);
+        } else {
+            rot(0); rot(1); rot(2);
+        }
+    }
+    if ((flags & 1) == 0) {
+        m._41 += pos[0];
+        m._42 += pos[1];
+        m._43 += pos[2];
+    }
+    return m;
+}
+
+// The local player's neutral pose, rebuilt when the entity or its tree
+// changes. False if the tree cannot be read.
+inline bool BuildNeutralPose() {
+    const uintptr_t entity = gamecam::ResolveEntity();
+    if (entity == 0 || !diag::Accessible(entity + ENTITY_TREE_OFFSET, 4, false))
+        return false;
+    const uintptr_t tree = *reinterpret_cast<const uintptr_t*>(entity + ENTITY_TREE_OFFSET);
+    if (tree == 0)
+        return false;
+    if (entity == neutral.entity && tree == neutral.tree)
+        return neutral.count > 0;
+    neutral.entity = entity;
+    neutral.tree = tree;
+    neutral.count = 0;
+    struct Pending {
+        uintptr_t node;
+        int parent;
+    };
+    Pending stack[2 * NEUTRAL_BONE_COUNT];
+    int top = 0;
+    stack[top++] = {tree, -1};
+    while (top > 0 && neutral.count < NEUTRAL_BONE_COUNT) {
+        const Pending p = stack[--top];
+        if (!diag::Accessible(p.node, NODE_SIZE, false)) {
+            neutral.count = 0;
+            return false;
+        }
+        const int idx = neutral.count++;
+        const D3DMATRIX local = NodeLocal(p.node);
+        neutral.world[idx] = p.parent >= 0 ? vrmod::Multiply(local, neutral.world[p.parent]) : local;
+        neutral.parent[idx] = p.parent;
+        // The whole subtree before the sibling: push the sibling first.
+        const uintptr_t child = *reinterpret_cast<const uintptr_t*>(p.node + 0x2C);
+        const uintptr_t sibling = *reinterpret_cast<const uintptr_t*>(p.node + 0x30);
+        if (sibling != 0 && top < 2 * NEUTRAL_BONE_COUNT)
+            stack[top++] = {sibling, p.parent};
+        if (child != 0 && top < 2 * NEUTRAL_BONE_COUNT)
+            stack[top++] = {child, idx};
+    }
+    return neutral.count > 0;
+}
+
+// The inverse of an affine row-vector matrix (the tree may carry scale).
+inline D3DMATRIX AffineInverse(const D3DMATRIX& m) {
+    const float a = m._11, b = m._12, c = m._13, d = m._21, e = m._22, f = m._23,
+                g = m._31, h = m._32, i = m._33;
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    const float inv = det != 0.0f ? 1.0f / det : 0.0f;
+    D3DMATRIX r = vrmod::Identity();
+    r._11 = (e * i - f * h) * inv;
+    r._12 = (c * h - b * i) * inv;
+    r._13 = (b * f - c * e) * inv;
+    r._21 = (f * g - d * i) * inv;
+    r._22 = (a * i - c * g) * inv;
+    r._23 = (c * d - a * f) * inv;
+    r._31 = (d * h - e * g) * inv;
+    r._32 = (b * g - a * h) * inv;
+    r._33 = (a * e - b * d) * inv;
+    r._41 = -(m._41 * r._11 + m._42 * r._21 + m._43 * r._31);
+    r._42 = -(m._41 * r._12 + m._42 * r._22 + m._43 * r._32);
+    r._43 = -(m._41 * r._13 + m._42 * r._23 + m._43 * r._33);
+    return r;
+}
+
+// bone x inverse(base) in the neutral pose.
+inline bool NeutralRelation(int bone, int base, D3DMATRIX& out) {
+    if (!BuildNeutralPose() || bone < 0 || base < 0 || bone >= neutral.count ||
+        base >= neutral.count)
+        return false;
+    out = vrmod::Multiply(neutral.world[bone], AffineInverse(neutral.world[base]));
+    return true;
+}
+
+// One line per weapon: the neutral relation to the hand next to the live
+// one, and a check of the walk - the attach bone against its parent, live
+// and neutral (equal when the animation leaves that joint alone).
+inline void LogNeutralCheck(int bone, const D3DMATRIX& bone_live, const D3DMATRIX& hand_live,
+                            bool neutral_ok) {
+    float live_d = 0.0f, live_deg = 0.0f;
+    RigidDelta(bone_live, hand_live, live_d, live_deg);
+    if (!neutral_ok) {
+        diag::Log("seatbone: bone %d - no neutral pose (tree unreadable), live relation used "
+                  "(%.2f units / %.1f deg from the hand bone)", bone, live_d, live_deg);
+        return;
+    }
+    D3DMATRIX rel;
+    NeutralRelation(bone, hand_bone_index, rel);
+    const float neutral_d = sqrtf(rel._41 * rel._41 + rel._42 * rel._42 + rel._43 * rel._43);
+    float c = (rel._11 + rel._22 + rel._33 - 1.0f) * 0.5f;
+    c = c > 1.0f ? 1.0f : (c < -1.0f ? -1.0f : c);
+    const float neutral_deg = acosf(c) * 180.0f / 3.14159265f;
+    const int parent = neutral.parent[bone];
+    float check_d = -1.0f, check_deg = -1.0f;
+    D3DMATRIX parent_live, local_neutral;
+    if (parent >= 0 && ArrayBoneWorld(parent, parent_live) &&
+        NeutralRelation(bone, parent, local_neutral)) {
+        const D3DMATRIX local_live = vrmod::Multiply(bone_live, vrmod::RigidInverse(parent_live));
+        RigidDelta(local_live, local_neutral, check_d, check_deg);
+    }
+    diag::Log("seatbone: bone %d held at its neutral pose: %.2f units / %.1f deg from the hand "
+              "bone (live now %.2f / %.1f); walk check vs parent %d: %.3f units / %.2f deg "
+              "(%d nodes)", bone, neutral_d, neutral_deg, live_d, live_deg, parent, check_d,
+              check_deg, neutral.count);
 }
 inline int part_index = 0;              // matrix # within the current bracket
 inline D3DMATRIX root_inv = vrmod::Identity();  // inverse of the bracket's first matrix
@@ -290,6 +530,10 @@ inline int split_index = -1;            // first off-hand part; -1 = single-hand
 inline D3DMATRIX left_root_inv = vrmod::Identity();
 inline bool have_left_grip = false;     // grip_world_left resolved this pass
 inline D3DMATRIX grip_world_left = vrmod::Identity();
+// The same plus the fist_* trim, for an off-hand half on another bone than
+// the left grip point.
+inline D3DMATRIX grip_world_left_fist = vrmod::Identity();
+inline bool left_on_fist = false;       // this off-hand bracket's bone is not the grip point
 // Diagnostics (a short log window after the grip is switched on).
 inline int log_budget = 0;
 inline bool prev_enabled = false;
@@ -305,6 +549,33 @@ inline int subst_sets_left = 0;         // off-hand re-seats this pass
 inline int subst_sets_left_last_pass = 0;
 inline int trails_suppressed = 0;       // trail renders skipped this pass
 inline int trails_suppressed_last_pass = 0;
+// Photon trails (see TRAIL_ADD). The transform the last re-seated part
+// got (point' = point x trail_map) and its hand, for the trail points
+// sampled right after that part's draw.
+inline D3DMATRIX trail_map = vrmod::Identity();
+inline int trail_map_hand = -1;         // 0 left, 1 right, -1 none this pass
+// Room space from world (the inverse of gamecam::WorldFromTracking).
+inline D3DMATRIX trail_room_from_world = vrmod::Identity();
+inline bool have_trail_room = false;
+// The owner's action mask while it carries the forced attack bit.
+inline uint32_t* trail_mask = nullptr;
+inline uint32_t trail_mask_saved = 0;
+inline uintptr_t current_owner = 0;     // the local player entity, per pass
+struct TrailSlot {
+    float prev[2][3] = {};              // room-space endpoints (m)
+    LONGLONG prev_qpc = 0;
+    bool prev_valid = false;
+    int hand = -1;                      // the hand of the last sample
+    bool on = false;                    // fast enough: samples are kept
+};
+inline TrailSlot trail_slots[WEAPON_TRAIL_SLOT_COUNT];
+inline LONGLONG trail_qpf = 0;
+// The weapon's shape follows the attack state (PairReshapes), so its trail
+// is not sampled outside attacks. Set per pass in OnFrame.
+inline bool trail_reshapes = false;
+inline bool trail_logged = false;       // first kept sample logged (per weapon)
+inline int trail_kept = 0;              // samples kept / dropped this pass
+inline int trail_dropped = 0;           // (totals: diag::trail_*)
 // Hand-bone stash keep-alive: passes since a held-weapon bracket last
 // fired - see the validity block in OnFrame.
 inline int passes_since_bracket = 100;
@@ -343,6 +614,13 @@ inline D3DMATRIX GripOffsetMatrix(float pitch_deg, float roll_deg,
 }
 
 // The active tuple: guns have their own, separate from melee.
+// The fist_* trim, for a weapon on another bone than its hand's grip point.
+inline D3DMATRIX FistTrim() {
+    return GripOffsetMatrix(vrmod::config.fist_pitch_deg, vrmod::config.fist_roll_deg,
+                            vrmod::config.fist_yaw_deg, vrmod::config.fist_fwd_cm,
+                            vrmod::config.fist_up_cm, vrmod::config.fist_side_cm);
+}
+
 inline D3DMATRIX ActiveGripOffset() {
     if (current_is_gun)
         return GripOffsetMatrix(vrmod::config.gun_pitch_deg,
@@ -456,61 +734,210 @@ inline void BracketClose() {
     }
 }
 
-inline void __fastcall HookDraw(void* self, void* edx) {
-    const bool owns = self != nullptr && self == current_weapon &&
-                      BracketOpen(self, "funnel", false, true);
-    original_draw(self, edx);
-    if (owns)
-        BracketClose();
-}
-
-// The composite entry (twin swords, mechguns): called once per half;
-// odd brackets within a pass are the off-hand half.
-inline void __fastcall HookCompDraw(void* self, void* edx) {
-    bool owns = false;
-    if (self != nullptr && self == current_weapon) {
-        const bool left = vrmod::config.twin_split && current_twin_comp &&
-                          (comp_ordinal & 1) != 0;
-        owns = BracketOpen(self, "comp", left, false);
-        if (owns)
-            comp_ordinal++;
-    }
-    original_comp_draw(self, edx);
-    if (owns)
-        BracketClose();
-}
-
-// True when a trail render's `this` is the re-seated local weapon (the
-// inline ribbon) or one of its trail-object slots.
-inline bool SuppressTrail(void* self) {
-    if (!have_grip || self == nullptr || current_weapon == nullptr)
-        return false;
-    if (self == current_weapon) {
-        trails_suppressed++;
-        return true;
-    }
+// The local weapon's trail slot holding this trail object, or -1.
+inline int TrailSlotOf(void* trail) {
+    if (trail == nullptr || current_weapon == nullptr)
+        return -1;
     const uintptr_t w = reinterpret_cast<uintptr_t>(current_weapon);
     for (int i = 0; i < WEAPON_TRAIL_SLOT_COUNT; i++) {
         const uintptr_t slot = w + WEAPON_TRAIL_SLOT_FIRST + i * 4;
         if (diag::Accessible(slot, 4, false) &&
-            self == *reinterpret_cast<void* const*>(slot)) {
-            trails_suppressed++;
-            return true;
-        }
+            trail == *reinterpret_cast<void* const*>(slot))
+            return i;
     }
-    return false;
+    return -1;
 }
 
-inline void __fastcall HookTrailA(void* self, void* edx) {
-    if (SuppressTrail(self))
-        return;
-    original_trail_a(self, edx);
+// Sampling outside attacks: a re-seated melee weapon with trails on. (Any
+// re-seated weapon's samples move onto the hand - HookTrailAdd.)
+inline bool TrailFromHand(void* weapon) {
+    return vrmod::config.weapon_trail && have_grip && weapon != nullptr &&
+           weapon == current_weapon && !current_is_gun;
 }
 
-inline void __fastcall HookTrailB(void* self, void* edx) {
-    if (SuppressTrail(self))
+// Gives the owner's action mask an attack bit for the sample sites, when
+// it has none and the weapon keeps its shape outside attacks. Returns
+// whether this call forced it (and must restore).
+inline bool ForceTrailMask(void* weapon) {
+    if (trail_mask != nullptr || trail_reshapes || !TrailFromHand(weapon))
+        return false;
+    const uintptr_t w = reinterpret_cast<uintptr_t>(weapon);
+    if (!diag::Accessible(w + WEAPON_OWNER_OFFSET, 4, false))
+        return false;
+    const uintptr_t owner = *reinterpret_cast<const uintptr_t*>(w + WEAPON_OWNER_OFFSET);
+    if (owner == 0 || owner != current_owner ||
+        !diag::Accessible(owner + ENTITY_ACTION_MASK_OFFSET, 4, true))
+        return false;
+    uint32_t* const mask = reinterpret_cast<uint32_t*>(owner + ENTITY_ACTION_MASK_OFFSET);
+    if ((*mask & ACTION_MASK_ATTACKING) != 0)
+        return false;  // attacking: the game samples anyway
+    trail_mask_saved = *mask;
+    *mask = trail_mask_saved | ACTION_MASK_ATTACK;
+    trail_mask = mask;
+    return true;
+}
+
+inline void RestoreTrailMask() {
+    if (trail_mask != nullptr)
+        *trail_mask = trail_mask_saved;
+    trail_mask = nullptr;
+}
+
+inline void __fastcall HookDraw(void* self, void* edx) {
+    const bool owns = self != nullptr && self == current_weapon &&
+                      BracketOpen(self, "funnel", false, true);
+    const bool forced = ForceTrailMask(self);
+    original_draw(self, edx);
+    if (forced)
+        RestoreTrailMask();
+    if (owns)
+        BracketClose();
+}
+
+// The composite entry: the held draw's two-pass path calls it inside its
+// own bracket (folded in); the class draws (+0xD8) and the mechguns'
+// 0x5E74EC call it once per half. A half drawn on a left-arm bone is the
+// off hand.
+inline void __fastcall HookCompDraw(void* self, void* edx) {
+    bool owns = false;
+    if (self != nullptr && self == current_weapon) {
+        const bool left = vrmod::config.twin_split && IsLeftArmBone(ReadAttachBone());
+        owns = BracketOpen(self, "comp", left, false);
+        if (owns && left)
+            draws_left_half = true;
+    }
+    // The model draw sees the real action mask; the held draw's samples
+    // after it see the forced one again.
+    uint32_t* const forced = trail_mask;
+    if (forced != nullptr)
+        *forced = trail_mask_saved;
+    original_comp_draw(self, edx);
+    if (forced != nullptr) {
+        trail_mask_saved = *forced;
+        *forced = trail_mask_saved | ACTION_MASK_ATTACK;
+    }
+    if (owns)
+        BracketClose();
+}
+
+// The trail render: the local weapon's trails are hidden while the re-seat
+// drives and trails are off (the game's ribbon follows the hidden arm).
+inline void __fastcall HookTrailRender(void* self, void* edx) {
+    if (!vrmod::config.weapon_trail && have_grip && TrailSlotOf(self) >= 0) {
+        trails_suppressed++;
         return;
-    original_trail_b(self, edx);
+    }
+    original_trail_render(self, edx);
+}
+
+inline void TransformPoint(const float p[3], const D3DMATRIX& m, float out[3]) {
+    out[0] = p[0] * m._11 + p[1] * m._21 + p[2] * m._31 + m._41;
+    out[1] = p[0] * m._12 + p[1] * m._22 + p[2] * m._32 + m._42;
+    out[2] = p[0] * m._13 + p[1] * m._23 + p[2] * m._33 + m._43;
+}
+
+inline float Distance3(const float a[3], const float b[3]) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+// Whether this slot's blade moves fast enough in room space for a trail:
+// starts at weapon_trail_speed, stops below TRAIL_STOP_RATIO of it.
+// Walking and turning move the world, not the room, so they never count.
+inline bool TrailFast(int slot, const float wa[3], const float wb[3], float& speed) {
+    TrailSlot& s = trail_slots[slot];
+    const float ws = vrmod::config.world_scale;
+    float ra[3], rb[3];
+    TransformPoint(wa, trail_room_from_world, ra);
+    TransformPoint(wb, trail_room_from_world, rb);
+    for (int i = 0; i < 3; i++) {
+        ra[i] /= ws;
+        rb[i] /= ws;
+    }
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    if (trail_qpf == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        trail_qpf = f.QuadPart;
+    }
+    speed = 0.0f;
+    if (s.prev_valid) {
+        const double dt = double(qpc.QuadPart - s.prev_qpc) / double(trail_qpf);
+        if (dt < 0.005)
+            return s.on;  // a second sample in the same tick
+        if (dt < 0.25) {
+            const float da = Distance3(ra, s.prev[0]);
+            const float db = Distance3(rb, s.prev[1]);
+            speed = (float)((da > db ? da : db) / dt);
+            const float start = vrmod::config.weapon_trail_speed;
+            s.on = s.on ? speed >= start * TRAIL_STOP_RATIO : speed >= start;
+        } else {
+            s.on = false;
+        }
+    } else {
+        s.on = false;
+    }
+    for (int i = 0; i < 3; i++) {
+        s.prev[0][i] = ra[i];
+        s.prev[1][i] = rb[i];
+    }
+    s.prev_qpc = qpc.QuadPart;
+    s.prev_valid = true;
+    return s.on;
+}
+
+// The trail's add routine: the local weapon's samples move onto the
+// re-seated weapon and are kept only on a fast swing. With no re-seat
+// transform this pass the sample is dropped rather than drawn along the
+// hidden arm.
+inline void __fastcall HookTrailAdd(void* self, void* edx, float* a, float* b) {
+    const int slot = (a != nullptr && b != nullptr && vrmod::config.weapon_trail && have_grip)
+                         ? TrailSlotOf(self) : -1;
+    if (slot < 0) {
+        original_trail_add(self, edx, a, b);
+        return;
+    }
+    if (trail_map_hand < 0 || !have_trail_room) {
+        trail_dropped++;
+        return;
+    }
+    // A slot that changed hands (the twin split latching) jumped rather
+    // than swung: restart its speed test and empty its ribbon, so the add's
+    // smoothing does not bridge the two hands.
+    TrailSlot& ts = trail_slots[slot];
+    if (ts.prev_valid && ts.hand != trail_map_hand) {
+        ts.prev_valid = false;
+        ts.on = false;
+        const uintptr_t t = reinterpret_cast<uintptr_t>(self);
+        if (diag::Accessible(t + TRAIL_VERTEX_COUNT_OFFSET, 4, true))
+            *reinterpret_cast<int*>(t + TRAIL_VERTEX_COUNT_OFFSET) = 0;
+    }
+    ts.hand = trail_map_hand;
+    float wa[3], wb[3];
+    TransformPoint(a, trail_map, wa);
+    TransformPoint(b, trail_map, wb);
+    float speed = 0.0f;
+    if (!TrailFast(slot, wa, wb, speed)) {
+        trail_dropped++;
+        return;
+    }
+    trail_kept++;
+    if (!trail_logged) {
+        trail_logged = true;
+        diag::Log("weapontrail: first trail sample kept (weapon %p slot %d, %s hand, %.2f m/s)",
+                  current_weapon, slot, trail_map_hand == 0 ? "left" : "right", speed);
+    }
+    original_trail_add(self, edx, wa, wb);
+}
+
+// The per-slot sample helper the class draw overrides call: the forced
+// attack bit for the length of the call.
+inline void __fastcall HookTrailSample(void* self, void* edx, int slot) {
+    const bool forced = ForceTrailMask(self);
+    original_trail_sample(self, edx, slot);
+    if (forced)
+        RestoreTrailMask();
 }
 
 // weapon_scale: uniform scale about the weapon root (the point pinned to
@@ -523,10 +950,26 @@ inline D3DMATRIX ScaleRel(D3DMATRIX rel, float s) {
     return rel;
 }
 
+// The re-seat of a world-space point, kept for the trail points sampled
+// after this part's draw: point x inverse(root), scaled about the root,
+// then onto the grip - the same steps as a part matrix.
+inline void NoteTrailMap(const D3DMATRIX& inv, const D3DMATRIX& grip, int hand) {
+    const D3DMATRIX scaled = vrmod::config.weapon_scale != 1.0f
+                                 ? ScaleRel(inv, vrmod::config.weapon_scale) : inv;
+    trail_map = vrmod::Multiply(scaled, grip);
+    trail_map_hand = hand;
+}
+
 // Every device WORLD SetTransform on world-space passes. Returns true
 // with the re-seated matrix in out.
 inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
     if (!bracket_open)
+        return false;
+    // A matrix at exactly the world origin opening a bracket is not a part
+    // (Phoenix Claw sets one before its parts): left alone, and the next
+    // matrix is the root.
+    if (part_index == 0 && fabsf(in._41) < 1e-4f && fabsf(in._42) < 1e-4f &&
+        fabsf(in._43) < 1e-4f)
         return false;
     const int i = part_index++;
     // Equipment part matrices are rigid, so RigidInverse is exact.
@@ -556,7 +999,7 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
                     seat_logged_weapon = current_weapon;
                     diag::Log("seatbone: attach bone %d%s; first matrix sits %.2f units / %.1f deg off it -> %s",
                               seat_index,
-                              seat_on_fist ? " (NOT the hand bone - fist rest lock + trim)" : " (the hand bone)",
+                              seat_on_fist ? " (NOT the hand bone - neutral pose + fist trim)" : " (the hand bone)",
                               dist, deg,
                               seated_on_bone ? "seating on the bone" : "too far, seating on the first matrix");
                 }
@@ -572,39 +1015,60 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
                 vrmod::hand_bone_world_right = root;
             vrmod::have_hand_bone_right = true;
             root_inv = vrmod::RigidInverse(root);
-            // Fist rest lock (see fist_rest).
+            // Off the hand bone: held at the neutral-pose relation to the
+            // hand (the live one if the tree cannot be read).
             if (have_hand) {
-                const D3DMATRIX delta = vrmod::Multiply(root, vrmod::RigidInverse(hand));
-                if (!fist_rest_locked) {
-                    if (have_fist_prev_delta) {
-                        float dd = 0.0f, ddeg = 0.0f;
-                        RigidDelta(delta, fist_prev_delta, dd, ddeg);
-                        fist_still_count = (dd <= FIST_LOCK_UNITS && ddeg <= FIST_LOCK_DEG)
-                                               ? fist_still_count + 1 : 0;
-                    }
-                    fist_prev_delta = delta;
-                    have_fist_prev_delta = true;
-                    if (fist_still_count >= FIST_LOCK_BRACKETS) {
-                        fist_rest = delta;
-                        fist_rest_locked = true;
-                        float rd = 0.0f, rdeg = 0.0f;
-                        RigidDelta(root, hand, rd, rdeg);
-                        diag::Log("seatbone: fist rest pose locked after %d still brackets (attach bone %.2f units / %.1f deg from the hand bone)",
-                                  fist_still_count, rd, rdeg);
-                    }
+                D3DMATRIX rel;
+                const bool neutral_ok = NeutralRelation(seat_index, hand_bone_index, rel);
+                if (!neutral_ok)
+                    rel = vrmod::Multiply(root, vrmod::RigidInverse(hand));
+                root_inv = vrmod::Multiply(root_inv, rel);
+                if (neutral_logged_weapon != current_weapon) {
+                    neutral_logged_weapon = current_weapon;
+                    LogNeutralCheck(seat_index, root, hand, neutral_ok);
                 }
-                root_inv = vrmod::Multiply(root_inv, fist_rest_locked ? fist_rest : delta);
             }
         } else {
-            root_inv = vrmod::RigidInverse(root);
-        }
-        // Composite off-hand brackets stash the left bone (the funnel
-        // split stashes it at split_index below).
-        bracket_drew = true;
-        if (bracket_is_left) {
-            vrmod::hand_bone_world_left = in;
+            // The off-hand half, mirrored: seated on its attach bone; a half
+            // off the left grip point (the hand bone's mirror) is held at
+            // that bone's neutral-pose relation to it plus the fist_* trim.
+            const int grip_bone = hand_bone_index - MIRROR_BONE_OFFSET;
+            const int attach = ReadAttachBone();
+            const int seat_index = attach >= 0 ? attach : grip_bone;
+            left_on_fist = seat_index != grip_bone;
+            D3DMATRIX bone;
+            bool seated_on_bone = false;
+            if (ArrayBoneWorld(seat_index, bone)) {
+                float dist = 0.0f, deg = 0.0f;
+                RigidDelta(in, bone, dist, deg);
+                seated_on_bone = dist <= SEAT_BONE_MAX_UNITS;
+                if (seated_on_bone)
+                    root = bone;
+                if (seat_logged_left != current_weapon) {
+                    seat_logged_left = current_weapon;
+                    diag::Log("seatbone: off-hand half on bone %d%s; first matrix sits %.2f units / %.1f deg off it -> %s",
+                              seat_index,
+                              left_on_fist ? " (NOT the left grip bone - neutral pose + fist trim)" : " (the left grip bone)",
+                              dist, deg,
+                              seated_on_bone ? "seating on the bone" : "too far, seating on the first matrix");
+                }
+            }
+            D3DMATRIX hand;
+            const bool have_hand =
+                left_on_fist && seated_on_bone && ArrayBoneWorld(grip_bone, hand);
+            // Composite off-hand brackets stash the left bone (the funnel
+            // split stashes it at split_index below).
+            vrmod::hand_bone_world_left = have_hand ? hand : root;
             vrmod::have_hand_bone_left = true;
+            root_inv = vrmod::RigidInverse(root);
+            if (have_hand) {
+                D3DMATRIX rel;
+                if (!NeutralRelation(seat_index, grip_bone, rel))
+                    rel = vrmod::Multiply(root, vrmod::RigidInverse(hand));
+                root_inv = vrmod::Multiply(root_inv, rel);
+            }
         }
+        bracket_drew = true;
     }
     // Twin-split learning (funnel brackets): track each part's drift from
     // its first-seen root-relative translation (part order is stable).
@@ -631,14 +1095,18 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
     if (boxed)
         return false;
     // Off-hand composite bracket: the whole bracket goes to the left grip,
-    // rooted at its own first matrix; no left pose = game animation.
+    // rooted at its seat; no left pose = game animation.
     if (bracket_is_left) {
-        if (!have_left_grip)
+        if (!have_left_grip) {
+            trail_map_hand = -1;
             return false;
+        }
         D3DMATRIX rel = vrmod::Multiply(in, root_inv);
         if (vrmod::config.weapon_scale != 1.0f)
             rel = ScaleRel(rel, vrmod::config.weapon_scale);
-        out = vrmod::Multiply(rel, grip_world_left);
+        const D3DMATRIX& grip = left_on_fist ? grip_world_left_fist : grip_world_left;
+        out = vrmod::Multiply(rel, grip);
+        NoteTrailMap(root_inv, grip, 0);
         subst_sets_left++;
         return true;
     }
@@ -649,14 +1117,17 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
             vrmod::hand_bone_world_left = in;
             vrmod::have_hand_bone_left = true;
         }
-        if (!have_left_grip)
+        if (!have_left_grip) {
+            trail_map_hand = -1;
             return false;
+        }
         if (i == split_index)
             left_root_inv = vrmod::RigidInverse(in);
         D3DMATRIX rel = vrmod::Multiply(in, left_root_inv);
         if (vrmod::config.weapon_scale != 1.0f)
             rel = ScaleRel(rel, vrmod::config.weapon_scale);
         out = vrmod::Multiply(rel, grip_world_left);
+        NoteTrailMap(left_root_inv, grip_world_left, 0);
         subst_sets_left++;
         return true;
     }
@@ -665,7 +1136,9 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
     D3DMATRIX rel = vrmod::Multiply(in, root_inv);
     if (vrmod::config.weapon_scale != 1.0f)
         rel = ScaleRel(rel, vrmod::config.weapon_scale);
-    out = vrmod::Multiply(rel, seat_on_fist ? grip_world_fist : grip_world);
+    const D3DMATRIX& grip = seat_on_fist ? grip_world_fist : grip_world;
+    out = vrmod::Multiply(rel, grip);
+    NoteTrailMap(root_inv, grip, 1);
     subst_sets++;
     return true;
 }
@@ -674,17 +1147,24 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
 inline void OnFrame() {
     bracket_open = false;
     part_index = 0;
-    comp_ordinal = 0;
     bracket_fired_last_pass = bracket_fired;
     bracket_drew_last_pass = bracket_drew;
     bracket_drew = false;
     subst_sets_last_pass = subst_sets;
     subst_sets_left_last_pass = subst_sets_left;
     trails_suppressed_last_pass = trails_suppressed;
+    diag::trail_kept_last_pass = trail_kept;
+    diag::trail_dropped_last_pass = trail_dropped;
+    diag::trail_kept_total += (unsigned)trail_kept;
+    diag::trail_dropped_total += (unsigned)trail_dropped;
     bracket_fired = false;
     subst_sets = 0;
     subst_sets_left = 0;
     trails_suppressed = 0;
+    trail_kept = 0;
+    trail_dropped = 0;
+    trail_map_hand = -1;
+    RestoreTrailMask();  // never left set across passes
 
 
     // The weapon pointer (null bare-handed), re-read every pass, and its
@@ -695,9 +1175,11 @@ inline void OnFrame() {
     current_is_gun = false;
     current_twin_funnel = false;
     current_twin_comp = false;
+    trail_reshapes = false;
     current_projectile = 0;
     current_fire_override = 0;
     const uintptr_t entity = gamecam::ResolveEntity();
+    current_owner = entity;
     if (entity != 0 && diag::Accessible(entity + PLAYER_WEAPON_SLOT, 4, false))
         current_weapon = *reinterpret_cast<void* const*>(entity + PLAYER_WEAPON_SLOT);
     if (current_weapon != nullptr) {
@@ -711,23 +1193,45 @@ inline void OnFrame() {
                 current_projectile =
                     *reinterpret_cast<const uint8_t*>(pmt + PMT_PROJECTILE_OFFSET);
         }
+        uintptr_t attacking_fn = WEAPON_VT_NOOP, idle_fn = WEAPON_VT_NOOP;
         if (diag::Accessible(w, 4, false)) {
             const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(w);
             if (vt != 0 && diag::Accessible(vt + WEAPON_FIRE_OVERRIDE_OFFSET, 4, false))
                 current_fire_override =
                     *reinterpret_cast<const uintptr_t*>(vt + WEAPON_FIRE_OVERRIDE_OFFSET);
+            if (vt != 0 && diag::Accessible(vt + WEAPON_VT_ATTACKING, 8, false)) {
+                attacking_fn = *reinterpret_cast<const uintptr_t*>(vt + WEAPON_VT_ATTACKING);
+                idle_fn = *reinterpret_cast<const uintptr_t*>(vt + WEAPON_VT_IDLE);
+            }
         }
+        const uint32_t flags = diag::Accessible(w + WEAPON_FLAGS_OFFSET, 4, false)
+                                   ? *reinterpret_cast<const uint32_t*>(w + WEAPON_FLAGS_OFFSET) : 0;
+        const uint8_t variant = diag::Accessible(w + WEAPON_VARIANT_OFFSET, 1, false)
+                                    ? *reinterpret_cast<const uint8_t*>(w + WEAPON_VARIANT_OFFSET) : 0;
         current_kind = KindOfCategory(current_category);
         current_is_gun = KindIsGun(current_kind);
-        // The twin split's kind gate.
-        current_twin_funnel = KindSplitsFunnel(current_kind);
+        // The twin split's gate: the kinds that are two-handers, and any
+        // weapon the held draw draws once per hand (the two-pass flag).
+        current_twin_funnel = KindSplitsFunnel(current_kind) ||
+                              (flags & WEAPON_FLAG_TWO_PASS) != 0;
         current_twin_comp = KindSplitsComposite(current_kind);
+        trail_reshapes = (attacking_fn != WEAPON_VT_NOOP || idle_fn != WEAPON_VT_NOOP) &&
+                         PairReshapes(attacking_fn, current_category, variant);
+        current_variant = variant;
+        current_attacking_fn = attacking_fn;
     }
     if (current_weapon != logged_weapon) {
         logged_weapon = current_weapon;
         seat_attach_bone = -1;   // re-read at the new weapon's first bracket
         seat_on_fist = false;
-        ResetFistLock();
+        draws_left_half = false;
+        for (TrailSlot& s : trail_slots)
+            s = TrailSlot();
+        trail_logged = false;
+        if (current_weapon != nullptr && trail_reshapes)
+            diag::Log("weapontrail: class 0x%02X variant %d reshapes on attack (attacking "
+                      "virtual 0x%08X) - its trail shows during attacks only",
+                      current_category, current_variant, (unsigned)current_attacking_fn);
         if (current_weapon != nullptr) {
             const bool old_rule = current_projectile != 0 ||
                                   IsKnownFiringOverride(current_fire_override);
@@ -774,17 +1278,20 @@ inline void OnFrame() {
             if (gamecam::WorldFromTracking(pose, hand_world)) {
                 const D3DMATRIX offset = ActiveGripOffset();
                 grip_world = vrmod::Multiply(offset, hand_world);
-                grip_world_fist = vrmod::Multiply(
-                    vrmod::Multiply(offset,
-                                    GripOffsetMatrix(vrmod::config.fist_pitch_deg,
-                                                     vrmod::config.fist_roll_deg,
-                                                     vrmod::config.fist_yaw_deg,
-                                                     vrmod::config.fist_fwd_cm,
-                                                     vrmod::config.fist_up_cm,
-                                                     vrmod::config.fist_side_cm)),
-                    hand_world);
+                grip_world_fist =
+                    vrmod::Multiply(vrmod::Multiply(offset, FistTrim()), hand_world);
                 have_grip = true;
             }
+        }
+    }
+    // Room space for the trails' speed test (the world-from-room transform
+    // is rigid).
+    have_trail_room = false;
+    if (have_grip) {
+        D3DMATRIX world_from_room;
+        if (gamecam::WorldFromTracking(vrmod::Identity(), world_from_room)) {
+            trail_room_from_world = vrmod::RigidInverse(world_from_room);
+            have_trail_room = true;
         }
     }
     // The off-hand grip, whenever a weapon is held (composite brackets need
@@ -797,8 +1304,10 @@ inline void OnFrame() {
         if (vrmod::Get()->GetHandPose(0, pose)) {  // 0 = left hand
             D3DMATRIX hand_world;
             if (gamecam::WorldFromTracking(pose, hand_world)) {
-                grip_world_left =
-                    vrmod::Multiply(ActiveGripOffset(), hand_world);
+                const D3DMATRIX offset = ActiveGripOffset();
+                grip_world_left = vrmod::Multiply(offset, hand_world);
+                grip_world_left_fist =
+                    vrmod::Multiply(vrmod::Multiply(offset, FistTrim()), hand_world);
                 have_left_grip = true;
             }
         }
@@ -811,12 +1320,14 @@ inline void OnFrame() {
     }
     if (vrmod::config.weapon_grip && log_budget > 0) {
         log_budget--;
-        diag::Log("weapongrip: weapon=%p cat=0x%02X gun=%d grip=%d gripL=%d split=%d drives=%d fired_last=%d sets_last=%d setsL_last=%d trails_last=%d",
+        diag::Log("weapongrip: weapon=%p cat=0x%02X gun=%d grip=%d gripL=%d split=%d drives=%d fired_last=%d sets_last=%d setsL_last=%d trails_hidden=%d trail_kept=%d trail_dropped=%d reshapes=%d",
                   current_weapon, current_category, current_is_gun ? 1 : 0,
                   have_grip ? 1 : 0, have_left_grip ? 1 : 0, split_index,
                   gamecam::DrivesView() ? 1 : 0,
                   bracket_fired_last_pass ? 1 : 0, subst_sets_last_pass,
-                  subst_sets_left_last_pass, trails_suppressed_last_pass);
+                  subst_sets_left_last_pass, trails_suppressed_last_pass,
+                  diag::trail_kept_last_pass, diag::trail_dropped_last_pass,
+                  trail_reshapes ? 1 : 0);
     }
 }
 
@@ -839,26 +1350,31 @@ inline void Install() {
         MH_CreateHook(reinterpret_cast<void*>(WEAPON_COMP_DRAW),
                       reinterpret_cast<void*>(&HookCompDraw),
                       reinterpret_cast<void**>(&original_comp_draw)) != MH_OK ||
-        MH_CreateHook(reinterpret_cast<void*>(TRAIL_RENDER_A),
-                      reinterpret_cast<void*>(&HookTrailA),
-                      reinterpret_cast<void**>(&original_trail_a)) != MH_OK ||
-        MH_CreateHook(reinterpret_cast<void*>(TRAIL_RENDER_B),
-                      reinterpret_cast<void*>(&HookTrailB),
-                      reinterpret_cast<void**>(&original_trail_b)) != MH_OK) {
+        MH_CreateHook(reinterpret_cast<void*>(TRAIL_RENDER),
+                      reinterpret_cast<void*>(&HookTrailRender),
+                      reinterpret_cast<void**>(&original_trail_render)) != MH_OK ||
+        MH_CreateHook(reinterpret_cast<void*>(TRAIL_ADD),
+                      reinterpret_cast<void*>(&HookTrailAdd),
+                      reinterpret_cast<void**>(&original_trail_add)) != MH_OK ||
+        MH_CreateHook(reinterpret_cast<void*>(TRAIL_SLOT_SAMPLE),
+                      reinterpret_cast<void*>(&HookTrailSample),
+                      reinterpret_cast<void**>(&original_trail_sample)) != MH_OK) {
         probe::Log("weapongrip: MH_CreateHook failed");
         return;
     }
     if (MH_EnableHook(reinterpret_cast<void*>(WEAPON_HELD_DRAW)) != MH_OK ||
         MH_EnableHook(reinterpret_cast<void*>(WEAPON_COMP_DRAW)) != MH_OK ||
-        MH_EnableHook(reinterpret_cast<void*>(TRAIL_RENDER_A)) != MH_OK ||
-        MH_EnableHook(reinterpret_cast<void*>(TRAIL_RENDER_B)) != MH_OK) {
+        MH_EnableHook(reinterpret_cast<void*>(TRAIL_RENDER)) != MH_OK ||
+        MH_EnableHook(reinterpret_cast<void*>(TRAIL_ADD)) != MH_OK ||
+        MH_EnableHook(reinterpret_cast<void*>(TRAIL_SLOT_SAMPLE)) != MH_OK) {
         probe::Log("weapongrip: MH_EnableHook failed");
         return;
     }
     installed = true;
-    probe::Log("weapongrip: held-weapon draw brackets (funnel 0x%08X + composite 0x%08X) + trail hooks installed (0x%08X / 0x%08X)",
+    probe::Log("weapongrip: held-weapon draw brackets (funnel 0x%08X + composite 0x%08X) + trail hooks installed (render 0x%08X, add 0x%08X, slot sample 0x%08X)",
                (unsigned)WEAPON_HELD_DRAW, (unsigned)WEAPON_COMP_DRAW,
-               (unsigned)TRAIL_RENDER_A, (unsigned)TRAIL_RENDER_B);
+               (unsigned)TRAIL_RENDER, (unsigned)TRAIL_ADD,
+               (unsigned)TRAIL_SLOT_SAMPLE);
 }
 
 }  // namespace weapongrip

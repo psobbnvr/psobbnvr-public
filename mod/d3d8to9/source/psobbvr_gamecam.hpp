@@ -122,19 +122,32 @@ inline bool hud_reseed = true;
 
 // The dead-zoned gaze follow: the HUD rests until the head has stayed more
 // than hud_follow_deg from it for hud_follow_wait_s, then glides back in
-// front of the head on a critically damped spring and rests again. While
-// a menu is open the zone is hud_follow_menu_deg, so reading across a
-// menu does not start a glide; a glide already running still finishes.
+// front of the head on a critically damped spring and rests again. Out of
+// menus a glide chases the head. While a menu is open the zone is
+// hud_follow_menu_deg, and it holds for a moving HUD too: a glide heads
+// for where the head looked when it started (or when the menu opened) and
+// moves on only when the head leaves the zone around that point, so
+// reading across the menu never drags it along. The menu closing sends a
+// running glide after the head again.
 inline bool hud_gaze_gliding = false;
 inline float hud_gaze_away_s = 0.0f;  // time the head has spent outside
 inline float hud_gaze_vel = 0.0f;     // glide speed, radians per second
 inline double hud_gaze_prev_t = 0.0;  // 0 = no previous call
+inline bool hud_gaze_fixed = false;   // the glide heads for hud_gaze_tx/tz
+inline float hud_gaze_tx = 0.0f, hud_gaze_tz = -1.0f;
 
 inline void HudGazeReset() {
     hud_gaze_gliding = false;
     hud_gaze_away_s = 0.0f;
     hud_gaze_vel = 0.0f;
     hud_gaze_prev_t = 0.0;
+    hud_gaze_fixed = false;
+}
+
+// Signed angle that turns direction a onto direction b (level unit
+// vectors).
+inline float YawBetween(float ax, float az, float bx, float bz) {
+    return atan2f(ax * bz - az * bx, ax * bx + az * bz);
 }
 
 // One step of the gaze follow on hud_fx/hud_fz; head = the tracking-space
@@ -153,13 +166,37 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
         return;
     hx /= hn;
     hz /= hn;
-    // Signed angle that turns the HUD's direction onto the head's.
-    const float gap = atan2f(hud_fx * hz - hud_fz * hx, hud_fx * hx + hud_fz * hz);
+    const bool menu = diag::ui_focused;
+    const float zone_deg =
+        menu ? vrmod::config.hud_follow_menu_deg : vrmod::config.hud_follow_deg;
+    const float zone = zone_deg * (3.14159265f / 180.0f);
+    // A glide in a menu heads for a fixed point: the head's direction when
+    // the menu opened mid-glide, or (below) when the glide started. It
+    // moves on only when the head leaves the zone around that point.
+    if (!menu) {
+        hud_gaze_fixed = false;
+    } else if (hud_gaze_gliding && !hud_gaze_fixed) {
+        hud_gaze_fixed = true;
+        hud_gaze_tx = hx;
+        hud_gaze_tz = hz;
+        diag::Log("hudfollow: menu opened mid-glide - the glide heads for where the head looks "
+                  "now (%+.0f deg from the HUD)",
+                  YawBetween(hud_fx, hud_fz, hx, hz) * 57.2958f);
+    } else if (hud_gaze_gliding) {
+        const float off = YawBetween(hud_gaze_tx, hud_gaze_tz, hx, hz);
+        if (fabsf(off) > zone) {
+            hud_gaze_tx = hx;
+            hud_gaze_tz = hz;
+            diag::Log("hudfollow: head %+.0f deg off the glide's end (menu zone %.0f) - it "
+                      "heads for the head now", off * 57.2958f, zone_deg);
+        }
+    }
+    const float tx = hud_gaze_fixed ? hud_gaze_tx : hx;
+    const float tz = hud_gaze_fixed ? hud_gaze_tz : hz;
+    // Signed angle that turns the HUD's direction onto the target's.
+    const float gap = YawBetween(hud_fx, hud_fz, tx, tz);
     if (!hud_gaze_gliding) {
-        const bool menu = diag::ui_focused;
-        const float zone_deg =
-            menu ? vrmod::config.hud_follow_menu_deg : vrmod::config.hud_follow_deg;
-        if (fabsf(gap) <= zone_deg * (3.14159265f / 180.0f)) {
+        if (fabsf(gap) <= zone) {
             hud_gaze_away_s = 0.0f;
             return;
         }
@@ -171,8 +208,13 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
         hud_gaze_gliding = true;
         hud_gaze_away_s = 0.0f;
         hud_gaze_vel = 0.0f;
+        if (menu) {
+            hud_gaze_fixed = true;
+            hud_gaze_tx = hx;
+            hud_gaze_tz = hz;
+        }
     }
-    // Critically damped spring toward the head, in the closed form that is
+    // Critically damped spring toward the target, in the closed form that is
     // stable at any dt (Game Programming Gems 4, 1.10): starts from rest,
     // so the HUD eases off rather than jumping, and settles to 5% in
     // hud_follow_glide_s.
@@ -182,7 +224,7 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
     const float temp = (hud_gaze_vel - omega * gap) * dt;
     hud_gaze_vel = (hud_gaze_vel - omega * temp) * decay;
     float step = gap + (temp - gap) * decay;
-    if ((gap > 0.0f) == (step > gap)) {  // never overshoot the head
+    if ((gap > 0.0f) == (step > gap)) {  // never overshoot the target
         step = gap;
         hud_gaze_vel = 0.0f;
     }
@@ -196,6 +238,7 @@ inline void HudGazeFollow(const D3DMATRIX& head) {
     if (fabsf(gap - step) < 0.0175f && fabsf(hud_gaze_vel) < 0.1f) {
         hud_gaze_gliding = false;
         hud_gaze_vel = 0.0f;
+        hud_gaze_fixed = false;
     }
 }
 

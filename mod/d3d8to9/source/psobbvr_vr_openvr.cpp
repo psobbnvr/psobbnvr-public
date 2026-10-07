@@ -96,6 +96,8 @@ void LoadConfig() {
     config.glow_below = settings::GetInt("vr", "glow_below", 1, path) != 0;
     config.burst_3d = settings::GetInt("vr", "burst_3d", 1, path) != 0;
     config.object_vis_fix = settings::GetInt("vr", "object_vis_fix", 1, path) != 0;
+    config.box_fade = settings::GetInt("vr", "box_fade", 1, path) != 0;
+    read_float("box_fade_scale", 0.99f, 16.001f, config.box_fade_scale);
     config.mag_glitch_fix = settings::GetInt("vr", "mag_glitch_fix", 1, path) != 0;
     config.mag_root_sync = settings::GetInt("vr", "mag_root_sync", 1, path) != 0;
     config.name_labels = settings::GetInt("vr", "name_labels", 1, path) != 0;
@@ -220,6 +222,7 @@ void LoadConfig() {
     config.ui_caller_rule = settings::GetInt("vr", "ui_caller_rule", 1, path) != 0;
     config.alpha_sprite_rule = settings::GetInt("vr", "alpha_sprite_rule", 1, path) != 0;
     read_float("alpha_sprite_floor", -0.001f, 20.001f, config.alpha_sprite_floor);
+    config.pool_sprite_rule = settings::GetInt("vr", "pool_sprite_rule", 1, path) != 0;
     config.sprite_upright = settings::GetInt("vr", "sprite_upright", 1, path) != 0;
     {
         char buf[256] = {};
@@ -300,6 +303,9 @@ void LoadConfig() {
     // Dual-wield split - off-hand half onto the left grip pose.
     config.twin_split = settings::GetInt("vr", "twin_split", 1, path) != 0;
     read_float("weapon_scale", 0.099f, 2.001f, config.weapon_scale);
+    // Photon swing trails (see Config::weapon_trail).
+    config.weapon_trail = settings::GetInt("vr", "weapon_trail", 1, path) != 0;
+    read_float("weapon_trail_speed", 0.099f, 20.001f, config.weapon_trail_speed);
     // Motion-controlled hands (psobbvr_hands.hpp).
     config.hand_presence = settings::GetInt("vr", "hand_presence", 1, path) != 0;
     read_float("hand_scale", 0.099f, 2.001f, config.hand_scale);

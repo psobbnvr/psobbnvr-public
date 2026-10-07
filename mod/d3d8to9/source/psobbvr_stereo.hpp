@@ -1554,6 +1554,21 @@ inline bool drop_alpha_sprite = false;
 // none); published by the hooks in psobbvr_particlepool.hpp.
 inline int current_particle_pool = -1;
 
+// Particle-pool quad in an inverse-colour blend ([vr] pool_sprite_rule).
+// Bit 4 of a pool record's flags (table 0xA101C0, +0x00) makes both pool
+// draw methods set src INVDESTCOLOR, with dest INVSRCCOLOR (0x7A905C) or,
+// with bit 2 too, INVSRCALPHA (0x7A9074). Pools 54..107 repeat the
+// textures of pools 0..53 with bit 4 set (e.g. pool 78, a soft glow
+// drawn on an opaque black square). Pool quads are world particles
+// whatever their blend; the caller identifies the pool.
+inline bool IsInverseColourPoolSprite(IDirect3DDevice9* dev) {
+    if (!vrmod::config.pool_sprite_rule || current_particle_pool < 0)
+        return false;
+    DWORD src_blend = 0;
+    dev->GetRenderState(D3DRS_SRCBLEND, &src_blend);
+    return src_blend == D3DBLEND_INVDESTCOLOR;
+}
+
 inline bool IsWorldRhw(IDirect3DDevice9* dev, const void* data, UINT stride, uintptr_t site = 0) {
     drop_alpha_sprite = false;
     if (data == nullptr || stride < 16)
@@ -1564,9 +1579,10 @@ inline bool IsWorldRhw(IDirect3DDevice9* dev, const void* data, UINT stride, uin
     if (z_enable == D3DZB_FALSE)
         return false;
     // Additive (dest ONE) is the world-effect blend; alpha-blended sprites
-    // need the narrower rule above.
+    // and inverse-colour pool quads need the narrower rules above.
     const bool alpha_sprite = dest_blend != D3DBLEND_ONE;
-    if (alpha_sprite && !IsAlphaSpriteBlend(dev, dest_blend, site))
+    if (alpha_sprite && !IsAlphaSpriteBlend(dev, dest_blend, site) &&
+        !IsInverseColourPoolSprite(dev))
         return false;
     if (alpha_sprite) {
         // Alpha sprites have their own lower floor (grass at the feet is
