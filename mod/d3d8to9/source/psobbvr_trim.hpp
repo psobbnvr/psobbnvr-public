@@ -2,10 +2,18 @@
 
 // First-person head trim: hides the player's own head, face and hair.
 //
-// At idle the head parts draw within ~0.25 m of the head anchor and
-// nothing else comes that close, but in attack lunges the head swings out
-// to ~0.5 m while the mag hovers down to ~0.38 m, so position alone cannot
-// tell them apart. Position bootstraps; texture identity decides:
+// Primary route: the game draws the head cluster through one routine
+// (HEAD_DRAW_ADDR, the player draw's step after the body walk), so a hook
+// there brackets the local player's head, hair and face draws and the
+// draw paths skip everything inside the bracket: nothing to learn, every
+// frame from the first, the same for every class. The matrix sets still
+// run, so the eye-height sampler keeps its head samples.
+//
+// Fallback (the hook off or not installed): at idle the head parts draw
+// within ~0.25 m of the head anchor and nothing else comes that close, but
+// in attack lunges the head swings out to ~0.5 m while the mag hovers down
+// to ~0.38 m, so position alone cannot tell them apart. Position
+// bootstraps; texture identity decides:
 //  - Learn zone (trim_radius_m around the anchor): draws are hidden and
 //    their stage-0 texture is learned as head content.
 //  - Wide zone (trim_wide_m): draws are hidden only if their texture was
@@ -24,6 +32,8 @@
 #include "psobbvr_probe.hpp"
 #include "psobbvr_vr.hpp"
 
+#include "MinHook.h"
+
 namespace trim {
 
 // Head point and feet in world space; valid only when the view was
@@ -31,6 +41,21 @@ namespace trim {
 inline bool valid = false;
 inline float head[3] = {};
 inline float feet[3] = {};
+
+// The head-cluster draw: the player draw 0x689DEC calls it after the
+// body walk with the entity in ECX (one other caller, 0x6ABD31). It
+// draws up to three models the entity holds - +0x9A8 pushed on bone
+// 58's matrix, +0x9A4 and +0x9A0 on bone 59's (the last through
+// 0x4E70C4 with the face state at +0x930 and the fade at +0x6FC) -
+// each under its own matrix from the character-model matrix-set site.
+constexpr uintptr_t HEAD_DRAW_ADDR = 0x0068A088;
+using HeadDrawFn = void(__fastcall*)(void* entity, void* edx);
+inline HeadDrawFn original_head_draw = nullptr;
+inline bool head_hook_installed = false;
+// Inside the local player's head draw: every world draw is skipped.
+inline bool head_draw_active = false;
+inline int head_draws_hidden = 0;       // this pass
+inline int head_draws_hidden_last = 0;  // the last pass that hid any
 
 // Zone of the most recent WORLD matrix: 0 = outside, 1 = wide, 2 = learn.
 inline int zone = 0;
@@ -127,9 +152,21 @@ inline void OnFrame() {
     valid = false;
     zone = 0;
     frame_counter++;
+    if (head_draws_hidden > 0)
+        head_draws_hidden_last = head_draws_hidden;
+    head_draws_hidden = 0;
     if (vrmod::config.trim_reset_pending) {
         vrmod::config.trim_reset_pending = false;
         ResetLearned();
+    }
+    if (vrmod::config.trim_status_request) {
+        vrmod::config.trim_status_request = false;
+        diag::Log("trim: %s; head draw %s (hook %s, %d draws hidden last pass); "
+                  "learn %.2f m, wide %.2f m, %d learned textures",
+                  vrmod::config.trim_head ? "on" : "off",
+                  vrmod::config.trim_head_draw ? "on" : "off",
+                  head_hook_installed ? "in" : "NOT installed", head_draws_hidden_last,
+                  vrmod::config.trim_radius_m, vrmod::config.trim_wide_m, learned_count);
     }
     if (!vrmod::config.trim_head || !gamecam::written_this_frame)
         return;
@@ -192,6 +229,10 @@ inline void OnSetTexture(DWORD stage, const void* texture) {
 inline bool SuppressNow() {
     if (!valid)
         return false;
+    if (head_draw_active) {
+        head_draws_hidden++;
+        return true;
+    }
     if (zone == 0) {
         return false;
     }
@@ -260,6 +301,42 @@ inline void ProbeCull(IDirect3DDevice9* dev, bool body) {
 
 inline DWORD BodyCullMode() {
     return vrmod::config.body_cull == 1 ? D3DCULL_CW : D3DCULL_CCW;
+}
+
+// The head-cluster draw, bracketed for the local player while VR drives
+// the view (valid) and the draw route is on.
+inline void __fastcall HookHeadDraw(void* entity, void* edx) {
+    const bool mine = !head_draw_active && valid && vrmod::config.trim_head_draw &&
+                      reinterpret_cast<uintptr_t>(entity) == gamecam::ResolveEntity();
+    if (mine)
+        head_draw_active = true;
+    original_head_draw(entity, edx);
+    if (mine)
+        head_draw_active = false;
+}
+
+// Called from every BeginScene; hooks once. Without the hook the
+// texture route alone hides the head.
+inline void Install() {
+    static bool tried = false;
+    if (tried)
+        return;
+    tried = true;
+    const MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+        diag::Log("trim: MH_Initialize failed (%d) - the head is hidden by its textures only",
+                  (int)status);
+        return;
+    }
+    if (MH_CreateHook(reinterpret_cast<void*>(HEAD_DRAW_ADDR),
+                      reinterpret_cast<void*>(&HookHeadDraw),
+                      reinterpret_cast<void**>(&original_head_draw)) != MH_OK ||
+        MH_EnableHook(reinterpret_cast<void*>(HEAD_DRAW_ADDR)) != MH_OK) {
+        diag::Log("trim: head draw hook failed - the head is hidden by its textures only");
+        return;
+    }
+    head_hook_installed = true;
+    diag::Log("trim: head draw 0x%08X hooked", (unsigned)HEAD_DRAW_ADDR);
 }
 
 } // namespace trim

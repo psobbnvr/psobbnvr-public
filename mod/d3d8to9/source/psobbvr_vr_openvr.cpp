@@ -51,6 +51,7 @@ void LoadConfig() {
     config.screen_fades = settings::GetInt("vr", "screen_fades", 1, path) != 0;
     config.letterbox = settings::GetInt("vr", "letterbox", 1, path) != 0;
     config.trim_head = settings::GetInt("vr", "trim_head", 1, path) != 0;
+    config.trim_head_draw = settings::GetInt("vr", "trim_head_draw", 1, path) != 0;
     const int body_cull = settings::GetInt("vr", "body_cull", 1, path);
     if (body_cull >= 0 && body_cull <= 2)
         config.body_cull = body_cull;
@@ -352,6 +353,9 @@ void LoadConfig() {
     }
     read_float("ik_neck_down_cm", -30.001f, 30.001f, config.ik_neck_down_cm);
     read_float("ik_neck_back_cm", -30.001f, 30.001f, config.ik_neck_back_cm);
+    read_float("ik_reach_cm", 29.999f, 120.001f, config.ik_reach_cm);
+    read_float("ik_arm_match", -0.001f, 1.001f, config.ik_arm_match);
+    read_float("ik_stretch_max", -0.001f, 0.501f, config.ik_stretch_max);
 
     // Launch summary for bug reports: the build, the ini values that shape
     // a session, and the files the VR path depends on (psobbvr-vr.log).

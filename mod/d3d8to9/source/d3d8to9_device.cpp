@@ -890,6 +890,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: the player draw walk + per-bone callback hooks behind the
 	// IK arms (psobbvr_ikarms.hpp); installed only once ik_arms is on.
 	ikarms::Install();
+	// psobbvr: the head-cluster draw bracket behind the first-person head
+	// trim (psobbvr_trim.hpp).
+	trim::Install();
 	// psobbvr: target-selection aim steering (psobbvr_targetaim.hpp).
 	targetaim::Install();
 	// psobbvr: gun bullet origin at the hand (psobbvr_gunfire.hpp).

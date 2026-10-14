@@ -2,6 +2,12 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.5.1-beta (2026-10-14)
+
+- Improved head culling method.
+- Eye height now set immediately at spawn - no jump in height after the first lobby spawn.
+- IK arms (experimental): improved arm placement, sizing, and handling of different character heights.
+
 ## 0.5.0-beta (2026-10-06)
 
 - Fixed photon trails on weapons not appearing.

@@ -500,6 +500,10 @@ inline void Apply() {
         settle_counter = 0;
         eyeheight::OnAnchorReset();  // fresh spawn: don't mix areas/poses
     }
+    // The standing head height from the class and proportions, checked
+    // every Apply so a new character given this entity's address is
+    // recomputed.
+    eyeheight::OnApply(entity);
     // A runtime recenter moves the seated origin, invalidating anchor_p0:
     // re-anchor at once.
     if (vrmod::Get()->PollRecentered())
@@ -685,9 +689,9 @@ inline void Apply() {
     anchor._11 = -eff_dz; anchor._13 = eff_dx;
     anchor._31 = -eff_dx; anchor._33 = -eff_dz;
     const float eye_x = feet[0];
-    // Eye level above the feet: the measured head height + eye_offset_m
-    // with auto on, else the fixed eye_height_m (also the fallback before
-    // the first capture).
+    // Eye level above the feet: the standing head height (the proportions',
+    // else the sampled capture) + eye_offset_m with auto on, else the
+    // fixed eye_height_m (also the fallback before either exists).
     float eye_units = vrmod::config.eye_height_m * vrmod::config.world_scale;
     if (vrmod::config.eye_height_auto && eyeheight::Valid())
         eye_units = eyeheight::Units() +

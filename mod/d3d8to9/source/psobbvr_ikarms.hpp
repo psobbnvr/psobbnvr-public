@@ -26,10 +26,18 @@
 // so world targets enter as world x inverse(root x [0xACD420]). Bone
 // lengths and the wrist-to-grip relation are measured from the walks.
 //
+// The controllers are at life-size distances from the eyes while the arm is
+// the character's size (0.7x to 1.6x the player's across the classes and
+// builds), so the upper arm and forearm are lengthened or shortened along
+// their bones to the player's reach (LengthFactor), and stretched a little
+// more rather than leave the hand off the wrist. The game's skinning
+// stretches the sleeve; the hand keeps its size.
+//
 // [vr] ik_arms: 1 on, 2 a fixed test pose. ik_anchor holds the shoulders
 // and hand bones at the idle pose (TrackIdle, HoldHand); its mode 2 also
 // moves the shoulders with the headset (BeginWalk). ik_raise_cm and
 // ik_shoulder_*_cm sit the arms higher under the raised camera.
+// ik_reach_cm, ik_arm_match and ik_stretch_max size the arm.
 #pragma once
 
 #include <cmath>
@@ -72,11 +80,20 @@ constexpr int BONE_COUNT = 64;
 // (0 = left, 1 = right). The wrist's subtree is contiguous in walk order:
 // the pivot (32 / 45, the wrist bend), its end node, the hand piece
 // (34 / 47) and the grip point.
+// The other children of the upper arm and forearm have no skin of their
+// own: the upper arm's attachment point (37 / 50; shields hang on 37), and
+// the forearm's end node (30 / 43) and attachment point (36 / 49).
 constexpr int HAND_BONE_COUNT = 4;
 struct ArmBones {
     int upper, fore, wrist, grip, hand_first;
+    int upper_attach;
+    int fore_attach[2];
 };
-constexpr ArmBones ARM_BONES[2] = {{28, 29, 31, 35, 32}, {41, 42, 44, 48, 45}};
+constexpr ArmBones ARM_BONES[2] = {{28, 29, 31, 35, 32, 37, {30, 36}},
+                                   {41, 42, 44, 48, 45, 50, {43, 49}}};
+// The arm's length factor stays within this range of the character's own.
+constexpr float LENGTH_FACTOR_MIN = 0.5f;
+constexpr float LENGTH_FACTOR_MAX = 2.0f;
 // The chest (parent of both shoulders, the neck and the head) and the two
 // chains on it that lead to the head.
 constexpr int CHEST_BONE = 25;
@@ -94,6 +111,15 @@ constexpr uintptr_t ENTITY_ACTION_MODE_OFFSET = 0x32E;
 constexpr short ACTION_MODE_IDLE = 1;
 constexpr uintptr_t ENTITY_FEET_OFFSET = 0x38;
 constexpr float FEET_STILL_STEP = 0.01f;  // units between walks
+// [entity+0x30] bit 0x100000 = the battle stance: set each tick by 0x6898CC
+// while the targeted enemy is near and ahead, cleared once it is lost or
+// farther off. The stand setup 0x6A1C8C picks its idle clip by it (0x69D1BC:
+// the weapon object's vtbl+0x48 battle idle, else vtbl+0x54), so standing near
+// an enemy plays a hunched, arms-in idle that is not the rest pose.
+constexpr uintptr_t ENTITY_STATE_FLAGS_OFFSET = 0x30;
+constexpr uint32_t STATE_BATTLE_STANCE = 0x00100000;
+// [entity+0xB8] word = the current animation clip (written by 0x694390).
+constexpr uintptr_t ENTITY_CLIP_OFFSET = 0xB8;
 
 struct Vec3 {
     float x, y, z;
@@ -185,9 +211,12 @@ struct Arm {
     // This frame's target: the grip point's world frame.
     D3DMATRIX target_world = {};
     bool have_target = false;
-    // This walk: the solved frames and what each bone ended up as.
+    // This walk: the solved frames (rigid), the length scale along the
+    // upper arm and forearm, and what each bone ended up as (the upper arm
+    // and forearm with that scale).
     bool posed = false;
     D3DMATRIX upper_out = {}, fore_out = {}, wrist_out = {};
+    float length_scale = 1.0f;
     D3DMATRIX upper_used = {}, fore_used = {}, wrist_used = {};
     // The last good pole side, for a target lined up with the pole.
     Vec3 prev_pole_side = {0.0f, 0.0f, 0.0f};
@@ -215,6 +244,8 @@ struct Arm {
     float last_reach = 0.0f;       // shoulder-to-wrist-target distance
     float last_grip_error = 0.0f;  // posed grip point vs the target
     float last_roll_deg = 0.0f;    // the hand's roll about the forearm
+    float last_fit = 1.0f;         // length factor for the player's reach
+    float last_stretch = 1.0f;     // extra stretch past it
 };
 inline Arm arms[2];
 
@@ -273,13 +304,22 @@ inline uintptr_t walk_bones = 0;
 inline D3DMATRIX walk_root = {};             // camera-relative
 inline D3DMATRIX walk_root_inv = {};
 inline D3DMATRIX walk_char_from_world = {};  // inverse(walk root x inverse view)
+inline float walk_char_per_world = 1.0f;     // its scale
 inline int walk_callbacks = 0;
 inline float walk_raise = 0.0f;              // ik_raise_cm in model units
 inline Vec3 walk_shoulder = {0.0f, 0.0f, 0.0f};  // the right shoulder's shift, model units
-// The game says idle and the feet have not moved since the last walk.
+// The game says idle in the relaxed stance and the feet have not moved since
+// the last walk.
 inline bool walk_idle_state = false;
 inline float prev_feet[3] = {};
 inline bool have_prev_feet = false;
+// The battle stance this walk, and whether the current clip began outside it
+// with the stance off ever since (the clip chosen at its start stays until
+// the next one, so the flag alone does not say which idle is playing).
+inline bool walk_battle_stance = false;
+inline bool walk_relaxed_clip = false;
+inline short prev_clip = 0, prev_mode = 0;
+inline bool have_prev_clip = false;
 // ik_anchor 2: this frame's neck point (world), and the shoulders' move
 // for this walk (character space).
 inline Vec3 neck_world = {0.0f, 0.0f, 0.0f};
@@ -309,6 +349,7 @@ inline void ResetModel() {
         a.have_prev_anim_shoulder = false;
         a.still_since = 0.0;
     }
+    have_prev_clip = false;
     logged_first_pose = false;
 }
 
@@ -454,6 +495,59 @@ inline void TwistForearm(Arm& arm, D3DMATRIX& fore, const D3DMATRIX& wrist,
     SetRow(fore, 2, z2 * c - y2 * s);
 }
 
+// A bone frame lengthened by `s` along its own x (the bone's direction), so
+// the bone's skin stretches with it.
+inline D3DMATRIX ScaleAlongBone(D3DMATRIX m, float s) {
+    m._11 *= s;
+    m._12 *= s;
+    m._13 *= s;
+    return m;
+}
+
+// A bone's length: its offset from the parent in the parent's own frame,
+// so a lengthened parent does not change the reading.
+inline bool BoneLength(const D3DMATRIX& child, const D3DMATRIX& parent, float& out) {
+    D3DMATRIX parent_inv;
+    if (!AffineInverse(parent, parent_inv))
+        return false;
+    out = Length(Row(vrmod::Multiply(child, parent_inv), 3));
+    return true;
+}
+
+// The length factor that fits this arm to the player's reach (ik_reach_cm:
+// shoulder to the middle of the fist, arm straight). The hand keeps its
+// size, so the arm makes up the reach less the wrist-to-grip distance (rel
+// = the wrist in the grip point's frame). ik_arm_match blends from the
+// character's own length (0) to the fitted one (1).
+inline float LengthFactor(const Arm& arm, const D3DMATRIX& rel) {
+    const float match = vrmod::config.ik_arm_match;
+    const float arm_len = arm.upper_len + arm.fore_len;
+    if (match == 0.0f || arm_len < 1e-3f)
+        return 1.0f;
+    const float reach = vrmod::config.ik_reach_cm * 0.01f * vrmod::config.world_scale *
+                        walk_char_per_world;
+    float fit = (reach - Length(Row(rel, 3))) / arm_len;
+    if (fit < LENGTH_FACTOR_MIN) fit = LENGTH_FACTOR_MIN;
+    if (fit > LENGTH_FACTOR_MAX) fit = LENGTH_FACTOR_MAX;
+    return 1.0f + match * (fit - 1.0f);
+}
+
+// A child of a lengthened arm bone: its place moves with the length, its
+// axes are rebuilt from the parent without the length scale, so it (and
+// anything drawn on it, such as a shield) is not skewed. `written` is the
+// parent as set, `rigid` the same frame unscaled.
+inline void Unstretch(D3DMATRIX* top, const D3DMATRIX& written, const D3DMATRIX& rigid) {
+    D3DMATRIX written_inv;
+    if (!AffineInverse(written, written_inv))
+        return;
+    const D3DMATRIX c = vrmod::Multiply(*top, walk_root_inv);
+    D3DMATRIX fixed = vrmod::Multiply(vrmod::Multiply(c, written_inv), rigid);
+    fixed._41 = c._41;
+    fixed._42 = c._42;
+    fixed._43 = c._43;
+    *top = vrmod::Multiply(fixed, walk_root);
+}
+
 // The fixed test pose: the wrist in front of the chest, in its rest
 // orientation (character space: +z forward, +y up, the model's right -x).
 inline D3DMATRIX TestWrist(int side, Vec3 shoulder) {
@@ -480,9 +574,10 @@ inline Vec3 ShoulderShift(int side) {
 }
 
 // ik_anchor: records the idle pose - this shoulder, and the hand bones
-// below in the same walk (HoldHand, OnGrip) - once the game says idle, the
-// feet are still and the shoulder has held still for IDLE_HOLD_S (attacks
-// hold still poses between combo steps, so stillness alone is not idle).
+// below in the same walk (HoldHand, OnGrip) - once the game says idle in the
+// relaxed stance, the feet are still and the shoulder has held still for
+// IDLE_HOLD_S (attacks hold still poses between combo steps, and the battle
+// stance's idle is still too, so stillness alone is not the rest pose).
 inline void TrackIdle(Arm& arm, Vec3 anim_shoulder) {
     const double now = vrmod::NowSeconds();
     const bool still = walk_idle_state && arm.have_prev_anim_shoulder &&
@@ -542,40 +637,60 @@ inline void OnUpper(int side, D3DMATRIX* top) {
         S = held;
     }
     D3DMATRIX wrist;
+    const D3DMATRIX* rel = nullptr;  // the wrist in the grip point's frame
     if (vrmod::config.ik_arms == 2) {
         wrist = TestWrist(side, S);
+        if (arm.have_wrist_from_grip)
+            rel = &arm.wrist_from_grip;
     } else {
         if (!arm.have_target || !arm.have_wrist_from_grip)
             return;
         D3DMATRIX grip = vrmod::Multiply(arm.target_world, walk_char_from_world);
         if (!Orthonormalize(grip))
             return;
-        const D3DMATRIX& rel = anchor && arm.have_idle_wrist ? arm.idle_wrist_from_grip
-                                                             : arm.wrist_from_grip;
-        wrist = vrmod::Multiply(rel, grip);
+        rel = anchor && arm.have_idle_wrist ? &arm.idle_wrist_from_grip
+                                            : &arm.wrist_from_grip;
+        wrist = vrmod::Multiply(*rel, grip);
     }
+    // The arm's length: fitted to the player's reach, then stretched up to
+    // ik_stretch_max toward a target still past it.
+    const Vec3 P = Row(wrist, 3);
+    const float fit = rel != nullptr ? LengthFactor(arm, *rel) : 1.0f;
+    const float full = (arm.upper_len + arm.fore_len) * fit;
+    const float reach = Length(P - S);
+    float stretch = 1.0f;
+    if (full > 1e-3f && reach > full) {
+        stretch = reach / full;
+        const float cap = 1.0f + vrmod::config.ik_stretch_max;
+        if (stretch > cap)
+            stretch = cap;
+    }
+    const float scale = fit * stretch;
     D3DMATRIX upper, fore;
-    if (!Solve(arm, S, Row(wrist, 3), arm.upper_len, arm.fore_len, PoleFor(side),
+    if (!Solve(arm, S, P, arm.upper_len * scale, arm.fore_len * scale, PoleFor(side),
                upper, fore))
         return;
     TwistForearm(arm, fore, wrist, vrmod::config.ik_twist);
     arm.upper_out = upper;
     arm.fore_out = fore;
     arm.wrist_out = wrist;
+    arm.length_scale = scale;
+    arm.last_fit = fit;
+    arm.last_stretch = stretch;
     arm.posed = true;
-    arm.upper_used = upper;
-    *top = vrmod::Multiply(upper, walk_root);
-    TraceArm(side, "posed", S, Row(wrist, 3));
+    arm.upper_used = ScaleAlongBone(upper, scale);
+    *top = vrmod::Multiply(arm.upper_used, walk_root);
+    TraceArm(side, "posed", S, P);
 }
 
 inline void OnFore(int side, D3DMATRIX* top) {
     Arm& arm = arms[side];
     const D3DMATRIX c = vrmod::Multiply(*top, walk_root_inv);
-    arm.upper_len = Length(Row(c, 3) - Row(arm.upper_used, 3));
-    arm.have_upper_len = true;
+    if (BoneLength(c, arm.upper_used, arm.upper_len))
+        arm.have_upper_len = true;
     if (arm.posed) {
-        arm.fore_used = arm.fore_out;
-        *top = vrmod::Multiply(arm.fore_out, walk_root);
+        arm.fore_used = ScaleAlongBone(arm.fore_out, arm.length_scale);
+        *top = vrmod::Multiply(arm.fore_used, walk_root);
     } else {
         arm.fore_used = c;
     }
@@ -584,8 +699,8 @@ inline void OnFore(int side, D3DMATRIX* top) {
 inline void OnWrist(int side, D3DMATRIX* top) {
     Arm& arm = arms[side];
     const D3DMATRIX c = vrmod::Multiply(*top, walk_root_inv);
-    arm.fore_len = Length(Row(c, 3) - Row(arm.fore_used, 3));
-    arm.have_fore_len = true;
+    if (BoneLength(c, arm.fore_used, arm.fore_len))
+        arm.have_fore_len = true;
     if (arm.posed) {
         arm.wrist_used = arm.wrist_out;
         *top = vrmod::Multiply(arm.wrist_out, walk_root);
@@ -617,6 +732,18 @@ inline void OnGrip(int side, int i, D3DMATRIX* top) {
         arm.last_grip_error =
             Length(Row(vrmod::Multiply(*top, walk_root_inv), 3) - Row(grip, 3));
     }
+}
+
+// The skinless children of the upper arm and forearm, under a lengthened
+// arm.
+inline void OnAttach(int side, int i, D3DMATRIX* top) {
+    const Arm& arm = arms[side];
+    if (!arm.posed || arm.length_scale == 1.0f)
+        return;
+    if (i == ARM_BONES[side].upper_attach)
+        Unstretch(top, arm.upper_used, arm.upper_out);
+    else
+        Unstretch(top, arm.fore_used, arm.fore_out);
 }
 
 // Moves a bone in the character's frame.
@@ -665,7 +792,9 @@ inline void OnBone() {
         const ArmBones& b = ARM_BONES[side];
         const int i = static_cast<int>(index);
         const bool hand = i >= b.hand_first && i < b.hand_first + HAND_BONE_COUNT;
-        if (i != b.upper && i != b.fore && i != b.wrist && !hand)
+        const bool attach =
+            i == b.upper_attach || i == b.fore_attach[0] || i == b.fore_attach[1];
+        if (i != b.upper && i != b.fore && i != b.wrist && !hand && !attach)
             continue;
         D3DMATRIX* top = *reinterpret_cast<D3DMATRIX* const*>(MATRIX_STACK_TOP_ADDR);
         if (top == nullptr ||
@@ -675,7 +804,8 @@ inline void OnBone() {
         else if (i == b.fore) OnFore(side, top);
         else if (i == b.wrist) OnWrist(side, top);
         else if (i == b.grip) OnGrip(side, i, top);
-        else HoldHand(side, i, top);
+        else if (hand) HoldHand(side, i, top);
+        else OnAttach(side, i, top);
         return;
     }
 }
@@ -713,15 +843,30 @@ inline bool BeginWalk(uintptr_t entity) {
         walk_root, *reinterpret_cast<const D3DMATRIX*>(INVERSE_VIEW_ADDR));
     if (!AffineInverse(root_world, walk_char_from_world))
         return false;
+    walk_char_per_world = Length(Row(walk_char_from_world, 0));
     walk_bones = bones;
     walk_callbacks = 0;
     const bool have_feet = diag::Accessible(entity + ENTITY_FEET_OFFSET, 12, false);
     const float* feet = reinterpret_cast<const float*>(entity + ENTITY_FEET_OFFSET);
     {
         bool idle = false;
-        if (diag::Accessible(entity + ENTITY_ACTION_MODE_OFFSET, 2, false))
-            idle = *reinterpret_cast<const short*>(entity + ENTITY_ACTION_MODE_OFFSET) ==
-                   ACTION_MODE_IDLE;
+        if (diag::Accessible(entity + ENTITY_ACTION_MODE_OFFSET, 2, false) &&
+            diag::Accessible(entity + ENTITY_STATE_FLAGS_OFFSET, 4, false) &&
+            diag::Accessible(entity + ENTITY_CLIP_OFFSET, 2, false)) {
+            const short mode = *reinterpret_cast<const short*>(entity + ENTITY_ACTION_MODE_OFFSET);
+            const short clip = *reinterpret_cast<const short*>(entity + ENTITY_CLIP_OFFSET);
+            walk_battle_stance =
+                (*reinterpret_cast<const uint32_t*>(entity + ENTITY_STATE_FLAGS_OFFSET) &
+                 STATE_BATTLE_STANCE) != 0;
+            if (!have_prev_clip || clip != prev_clip || mode != prev_mode)
+                walk_relaxed_clip = !walk_battle_stance;
+            else if (walk_battle_stance)
+                walk_relaxed_clip = false;
+            prev_clip = clip;
+            prev_mode = mode;
+            have_prev_clip = true;
+            idle = mode == ACTION_MODE_IDLE && walk_relaxed_clip;
+        }
         if (have_feet) {
             const float dx = feet[0] - prev_feet[0], dy = feet[1] - prev_feet[1],
                         dz = feet[2] - prev_feet[2];

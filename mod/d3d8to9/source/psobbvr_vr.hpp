@@ -196,8 +196,9 @@ struct Config {
     // eye_height_auto is off or has no measurement yet; meters for a
     // game-unit dimension, so it fits only one build and world scale.
     float eye_height_m = 1.58f;
-    // 1 = the camera and head-trim anchor use the character's measured
-    // standing head height (psobbvr_eyeheight.hpp) instead of the fixed
+    // 1 = the camera and head-trim anchor use the character's standing
+    // head height (psobbvr_eyeheight.hpp: computed from the class and body
+    // proportions, else sampled from the head's draw) instead of the fixed
     // meters knobs.
     int eye_height_auto = 1;
     // Eyes above the measured head-matrix origin (the head pivot), meters.
@@ -321,6 +322,10 @@ struct Config {
     bool trim_head = true;
     float trim_radius_m = 0.25f;
     float trim_wide_m = 1.2f;
+    // Hide the head through the game's own head-cluster draw (the player
+    // draw's step for the head, hair and face models), nothing learned;
+    // 0 = the learned-texture route alone.
+    bool trim_head_draw = true;
     // Trim anchor height above the feet: the character's real head height,
     // independent of eye_height_m (raising it empties the learn zone).
     // Meters for a game-unit dimension (1.6 m = 16 units only at
@@ -334,6 +339,8 @@ struct Config {
     // Developer-build one-shot request, consumed by trim::OnFrame (the
     // developer tools cannot include the trim header - include cycle).
     bool trim_reset_pending = false;
+    // Developer-build one-shot request: log the trim status next frame.
+    bool trim_status_request = false;
     // Developer-build diagnostic: frames of trim logging left.
     int trim_probe_request = 0;
     // Developer-build diagnostic: samples left of the swing-motion trace
@@ -705,7 +712,7 @@ struct Config {
     float ik_raise_cm = 0.0f;
     // Move just the shoulder joints (and the arms on them) while posing:
     // up, forward, and in toward the middle.
-    float ik_shoulder_up_cm = 10.0f;
+    float ik_shoulder_up_cm = 15.0f;
     float ik_shoulder_fwd_cm = 0.0f;
     float ik_shoulder_in_cm = 0.0f;
     // Hold the shoulders and hands at their idle pose while the character
@@ -715,11 +722,19 @@ struct Config {
     // ik_anchor 2: the neck point the shoulders follow, below and behind
     // the tracked head (centimeters, head frame), so turning or tipping
     // the head about the neck leaves the shoulders still.
-    float ik_neck_down_cm = 7.5f;
-    float ik_neck_back_cm = 8.0f;
+    float ik_neck_down_cm = 18.0f;
+    float ik_neck_back_cm = 6.0f;
     // How much of the hand's roll the forearm takes (0..1); the wrist
     // takes the rest.
     float ik_twist = 0.65f;
+    // The player's reach (shoulder to the middle of the fist, arm
+    // straight): the arms are lengthened or shortened so they straighten
+    // with the player's. ik_arm_match blends from the character's own arm
+    // length (0) to the fitted one (1); ik_stretch_max is how far past it
+    // an arm may stretch to keep the hand on the wrist (0.1 = 10 %).
+    float ik_reach_cm = 68.0f;
+    float ik_arm_match = 1.0f;
+    float ik_stretch_max = 0.1f;
     // Developer-build one-shots: log this many posed walks; log the
     // status line.
     int ik_trace_request = 0;

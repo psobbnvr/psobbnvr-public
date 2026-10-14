@@ -166,6 +166,9 @@ inline constexpr OldDefault kOldDefaults[] = {
     {"vr", "fist_fwd_cm", "11", "weapon_trail"},
     {"vr", "fist_up_cm", "-12", "weapon_trail"},
     {"vr", "fist_side_cm", "-1", "weapon_trail"},
+    {"vr", "ik_shoulder_up_cm", "10", "ik_reach_cm"},
+    {"vr", "ik_neck_down_cm", "7.5", "ik_reach_cm"},
+    {"vr", "ik_neck_back_cm", "8", "ik_reach_cm"},
 };
 
 // Settings earlier releases shipped that the defaults file no longer
