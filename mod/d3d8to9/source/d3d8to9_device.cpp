@@ -24,9 +24,13 @@
 #include "psobbvr_weapongrip.hpp"
 #include "psobbvr_hands.hpp"
 #include "psobbvr_ikarms.hpp"
+#include "psobbvr_handclose.hpp"
+#include "psobbvr_handfit.hpp"
 #include "psobbvr_targetaim.hpp"
 #include "psobbvr_gunfire.hpp"
 #include "psobbvr_techcast.hpp"
+#include "psobbvr_wheel.hpp"
+#include "psobbvr_wheel_draw.hpp"
 #include "psobbvr_haptics.hpp"
 #include "psobbvr_cullfov.hpp"
 #include "psobbvr_drawdist.hpp"
@@ -69,7 +73,10 @@ Direct3DDevice8::~Direct3DDevice8()
 	if (stereo::device == ProxyInterface)
 		stereo::ReleaseTargets();
 	swingind::ReleaseAssets();
+	wheeldraw::ReleaseAssets();
 	hotbarmark::ReleaseAssets();
+	// psobbvr: the hand fit's worker thread stops (nothing when it never ran).
+	fithand::Shutdown();
 
 	delete ProxyAddressLookupTable;
 }
@@ -253,6 +260,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 	// D3DPOOL_DEFAULT and would make Reset fail; they are recreated lazily.
 	stereo::ReleaseTargets();
 	swingind::ReleaseAssets();
+	wheeldraw::ReleaseAssets();
 	hotbarmark::ReleaseAssets();
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
@@ -305,6 +313,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	// psobbvr: keep the root matrix the bones were posed with this frame
 	// for next tick's mag updates (psobbvr_objvis.hpp).
 	objvis::OnFrameEnd();
+	// psobbvr: the spell wheel's per-frame state, once per presented frame
+	// (psobbvr_wheel.hpp; BeginScene runs twice per frame).
+	wheel::Tick();
 	return HandlePresentResult(hr);
 }
 // psobbvr: PSO exits with the "display properties changed" dialog when
@@ -351,6 +362,7 @@ HRESULT Direct3DDevice8::HandlePresentResult(HRESULT hr)
 		CurrentZBiasRenderState = 0;
 		stereo::ReleaseTargets();
 		swingind::ReleaseAssets();
+		wheeldraw::ReleaseAssets();
 		hotbarmark::ReleaseAssets();
 
 		D3DPRESENT_PARAMETERS PresentParams = LastPresentParams;
@@ -900,8 +912,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: the edit-box hook behind the VR keyboard's text-field
 	// detection (psobbvr_vrkeyboard.hpp).
 	vrkeyboard::Install();
-	// psobbvr: technique-cast facing-chase suppression
-	// (psobbvr_techcast.hpp; [vr] cast_facing_snap).
+	// psobbvr: the spell wheel's hidden palette slot - the targeting-roll,
+	// reticle, slot-getter and dispatcher hooks (psobbvr_wheel.hpp).
+	wheel::Install();
+	// psobbvr: technique-cast facing-chase suppression and the left-ray
+	// aim of unlocked aimed casts (psobbvr_techcast.hpp; [vr]
+	// cast_facing_snap, cast_aim_point).
 	techcast::Install();
 	// psobbvr: the TakeHit hook behind the melee hit pulse and the hit
 	// census (psobbvr_haptics.hpp).
@@ -927,6 +943,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: IK arms targets for this frame (psobbvr_ikarms.hpp); after
 	// weapongrip (the grip tuple) and Apply (the takeover pose).
 	ikarms::OnFrame();
+	// psobbvr: the fist closing around the held weapon (IK arms): after the
+	// weapon module (snapshot, seat), the hands' mesh capture state and the
+	// IK arms' active state it reads. fithand::Step runs closefist::Step
+	// unchanged unless [vr] hand_fit is on, when the hand fit
+	// (psobbvr_handfit.hpp) takes the closing's place.
+	fithand::Step();
 	// psobbvr: this frame's aim yaw for the target-selection facing swap;
 	// after weapongrip (current_is_gun) and Apply (gaze/anchor).
 	targetaim::OnFrame();
@@ -953,6 +975,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	// psobbvr: swing-timing indicator state (psobbvr_swingind.hpp) - after
 	// the controller, whose swing and hold state it reads.
 	swingind::Update(gamecam::Enabled() && gamecam::DrivesView());
+	// psobbvr: the spell wheel's ring panel and hand icon state
+	// (psobbvr_wheel_draw.hpp) - after the controller, which runs the
+	// wheel's input side.
+	wheeldraw::Update();
 	// psobbvr: readied-hotkey highlight state (psobbvr_hotbarmark.hpp).
 	hotbarmark::Update(gamecam::Enabled() && gamecam::DrivesView());
 	// psobbvr: VR locomotion shaping - scaled turn speed + backwards walking
@@ -966,8 +992,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndScene()
 {
-	// psobbvr: VR hands fallback for a pass without a 2D draw.
+	// psobbvr: VR hands fallback for a pass without a 2D draw, and the
+	// spell wheel's hand icon with them (psobbvr_wheel_draw.hpp).
 	hands::OnPassEnd(ProxyInterface);
+	wheeldraw::OnPassEnd(ProxyInterface);
 	return ProxyInterface->EndScene();
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
@@ -1638,6 +1666,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 	// runs; they render at the first 2D (RHW) draw of the pass, once the
 	// 3D scene is complete (psobbvr_hands.hpp).
 	hands::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
+	// psobbvr: the spell wheel's hand icon, at the same point (psobbvr_wheel_draw.hpp).
+	wheeldraw::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
 	probe::Log("DrawPrimitive type=%d prims=%u fvf=0x%X", PrimitiveType, PrimitiveCount, probe::current_fvf);
 	// psobbvr: warp-tunnel gate - count perspective scene draws per
 	// present, before any suppression (a trimmed head strip is still scene
@@ -1711,6 +1741,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 	// runs; they render at the first 2D (RHW) draw of the pass, once the
 	// 3D scene is complete (psobbvr_hands.hpp).
 	hands::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
+	// psobbvr: the spell wheel's hand icon, at the same point (psobbvr_wheel_draw.hpp).
+	wheeldraw::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
 	probe::Log("DrawIndexedPrimitive type=%d prims=%u verts=%u fvf=0x%X", PrimitiveType, PrimitiveCount, NumVertices, probe::current_fvf);
 	// psobbvr: warp-tunnel gate - same scene-draw count as DrawPrimitive.
 	if (!resolution::IsRhwFvf(probe::current_fvf) && stereo::WantsDuplication() &&
@@ -1769,12 +1801,17 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	// runs; they render at the first 2D (RHW) draw of the pass, once the
 	// 3D scene is complete (psobbvr_hands.hpp).
 	hands::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
+	// psobbvr: the spell wheel's hand icon, at the same point (psobbvr_wheel_draw.hpp).
+	wheeldraw::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
 	if (probe::enabled && resolution::IsRhwFvf(probe::current_fvf) && pVertexStreamZeroData != nullptr)
 		probe::Log("DrawPrimitiveUP type=%d prims=%u stride=%u fvf=0x%X rhw0=%.5f", PrimitiveType, PrimitiveCount, VertexStreamZeroStride, probe::current_fvf,
 		           reinterpret_cast<const float*>(pVertexStreamZeroData)[3]);
 	else
 		probe::Log("DrawPrimitiveUP type=%d prims=%u stride=%u fvf=0x%X", PrimitiveType, PrimitiveCount, VertexStreamZeroStride, probe::current_fvf);
 	const bool Rhw = resolution::IsRhwFvf(probe::current_fvf);
+	// psobbvr: weapon geometry snapshot (psobbvr_weaponsnap.hpp).
+	if (weaponsnap::Collecting() && !Rhw && !resolution::passthrough && weapongrip::ExemptingDraws())
+		weaponsnap::RecordPlain(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride, stereo::GameViewportIsBoxed());
 	// psobbvr: warp-tunnel gate - same scene-draw count as DrawPrimitive.
 	if (!Rhw && stereo::WantsDuplication() && !resolution::passthrough)
 		stereo::NoteSceneDraw();
@@ -1807,6 +1844,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		                      VertexStreamZeroStride,
 		                      resolution::VertexCountForPrimitives(PrimitiveType, PrimitiveCount),
 		                      PrimitiveType, PrimitiveCount, probe::current_fvf);
+	// psobbvr: hand reshape (IK arms) - a copy of a hand-band draw with its
+	// vertices moved; the game's pointer back until it is enabled.
+	if (!Rhw && !resolution::passthrough)
+		pVertexStreamZeroData = hands::SubstituteBandDraw(pVertexStreamZeroData, VertexStreamZeroStride,
+		                                                  resolution::VertexCountForPrimitives(PrimitiveType, PrimitiveCount),
+		                                                  PrimitiveType, PrimitiveCount, probe::current_fvf);
 	// psobbvr: arm hide (see DrawPrimitive) - the body's strips
 	// come through here.
 	if (!Rhw && !resolution::passthrough && partmap::HideArmDrawNow())
@@ -1996,6 +2039,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	// runs; they render at the first 2D (RHW) draw of the pass, once the
 	// 3D scene is complete (psobbvr_hands.hpp).
 	hands::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
+	// psobbvr: the spell wheel's hand icon, at the same point (psobbvr_wheel_draw.hpp).
+	wheeldraw::MaybeDraw(ProxyInterface, !resolution::IsRhwFvf(probe::current_fvf));
 	if (probe::enabled && resolution::IsRhwFvf(probe::current_fvf) && pVertexStreamZeroData != nullptr)
 		probe::Log("DrawIndexedPrimitiveUP type=%d prims=%u verts=%u stride=%u fvf=0x%X rhw0=%.5f", PrimitiveType, PrimitiveCount, NumVertexIndices, VertexStreamZeroStride, probe::current_fvf,
 		           reinterpret_cast<const float*>(pVertexStreamZeroData)[3]);
@@ -2003,6 +2048,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 		probe::Log("DrawIndexedPrimitiveUP type=%d prims=%u verts=%u stride=%u fvf=0x%X", PrimitiveType, PrimitiveCount, NumVertexIndices, VertexStreamZeroStride, probe::current_fvf);
 	// psobbvr: same screen-space handling as DrawPrimitiveUP.
 	const bool Rhw = resolution::IsRhwFvf(probe::current_fvf);
+	// psobbvr: weapon geometry snapshot (psobbvr_weaponsnap.hpp).
+	if (weaponsnap::Collecting() && !Rhw && !resolution::passthrough && weapongrip::ExemptingDraws())
+		weaponsnap::RecordIndexed(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride, stereo::GameViewportIsBoxed());
 	// psobbvr: warp-tunnel gate - same scene-draw count as DrawPrimitive.
 	if (!Rhw && stereo::WantsDuplication() && !resolution::passthrough)
 		stereo::NoteSceneDraw();

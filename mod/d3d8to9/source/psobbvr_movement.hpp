@@ -12,6 +12,8 @@
 //   [vr] back_strafe       - back input walks backwards (no 180 turn)
 //   [vr] side_turn         - turn-key-only input turns in place instead
 //                            of running 90 deg to the side
+//   [vr] contact_by_move   - a touched body stops moves into it, judged
+//                            by the move's direction, not the facing
 //
 // Player movement internals (player vtable 0x00B39460; locomotion lives in
 // 0x685000-0x6B0000):
@@ -1063,6 +1065,91 @@ inline uint32_t __fastcall StandSteerDetour(void* self, void* edx) {
     return original_stand_steer(self, edx);
 }
 
+// Body contact judged by the move. After each move the player's collision
+// phase 0x00689020 runs a contact pass per entity range (0x007B6894
+// players, 0x007B798C enemies, 0x007B7E9C objects) and, for each body it
+// now touches, calls 0x007B7704 (circle shape) or 0x007B6E14 (box shape),
+// thiscall(mover; other entity, other's shape), ret 8. Both undo the move
+// - the feet go back on the floor under last tick's position (+0x44) -
+// when the body is ahead of the facing (+0x60): 0x007B7704 when the
+// body's centre is within 90 deg of it (0x007A900C gap), 0x007B6E14 when
+// the slid move is within about 112 deg of it (0x007A9018 gap above
+// 0x2FFF; its corner case also nudges the feet 0.1 along the facing). The
+// flat game always faces where it walks. With the facing held apart from
+// the walk, backing into a body never triggers the undo, and a touched
+// body ahead of the facing undoes every move, backing away included. For
+// our entity each call sees this tick's move direction as the facing.
+constexpr uintptr_t CONTACT_CIRCLE_ADDR = 0x007B7704;
+constexpr uintptr_t CONTACT_BOX_ADDR = 0x007B6E14;
+constexpr uintptr_t PREV_POS_OFFSET = 0x44;  // last tick's feet (vec3)
+// Moves outside this range keep the stock rule: below it the feet did not
+// move; above it the move was a warp or other jump, not a step.
+constexpr float CONTACT_STEP_MIN = 0.001f;
+constexpr float CONTACT_STEP_MAX = 30.0f;
+
+using ContactFn = uint32_t(__fastcall*)(void* self, void* edx, void* other, void* shape);
+inline ContactFn original_contact_circle = nullptr;
+inline ContactFn original_contact_box = nullptr;
+inline bool contact_logged = false;
+
+// Puts this tick's move direction in our entity's facing for one call.
+struct MoveFacingGuard {
+    int32_t* facing = nullptr;
+    int32_t saved = 0;
+    int move_bams = 0;
+    explicit MoveFacingGuard(void* self) {
+        if (!patches_applied || !vrmod::config.contact_by_move || self == nullptr)
+            return;
+        const uintptr_t ours = gamecam::ResolveEntity();
+        if (ours == 0 || reinterpret_cast<uintptr_t>(self) != ours)
+            return;
+        uint8_t* e = reinterpret_cast<uint8_t*>(self);
+        const float* feet = reinterpret_cast<const float*>(e + gamecam::ENTITY_POS_OFFSET);
+        const float* prev = reinterpret_cast<const float*>(e + PREV_POS_OFFSET);
+        const float dx = feet[0] - prev[0];
+        const float dz = feet[2] - prev[2];
+        const float len2 = dx * dx + dz * dz;
+        if (len2 < CONTACT_STEP_MIN * CONTACT_STEP_MIN ||
+            len2 > CONTACT_STEP_MAX * CONTACT_STEP_MAX)
+            return;
+        // The game's angle of a direction (x, z): atan2(x, z) in 65536ths
+        // of a turn.
+        move_bams = (int)lroundf(atan2f(dx, dz) * (32768.0f / 3.14159265f)) & 0xFFFF;
+        facing = reinterpret_cast<int32_t*>(e + gamecam::ENTITY_FACING_OFFSET);
+        saved = *facing;
+        *facing = move_bams;
+    }
+    ~MoveFacingGuard() {
+        if (facing != nullptr)
+            *facing = saved;
+    }
+};
+
+inline void NoteContact(const char* shape, const MoveFacingGuard& guard, bool undone) {
+    if (guard.facing == nullptr)
+        return;
+    if (undone && !contact_logged) {
+        contact_logged = true;
+        diag::Log("movement: a move into a touched body was stopped, judged by the "
+                  "move's direction (%s shape; first sighting)", shape);
+    }
+}
+
+inline uint32_t __fastcall ContactCircleDetour(void* self, void* edx, void* other, void* shape) {
+    MoveFacingGuard guard(self);
+    const uint32_t r = original_contact_circle(self, edx, other, shape);
+    NoteContact("circle", guard, r != 0);
+    return r;
+}
+
+// Returns its result in AL.
+inline uint32_t __fastcall ContactBoxDetour(void* self, void* edx, void* other, void* shape) {
+    MoveFacingGuard guard(self);
+    const uint32_t r = original_contact_box(self, edx, other, shape);
+    NoteContact("box", guard, (r & 0xFF) != 0);
+    return r;
+}
+
 inline void InstallInputHook() {
     static bool tried = false;
     if (tried)
@@ -1140,6 +1227,29 @@ inline void InstallInputHook() {
     } else {
         probe::Log("movement: entity guard installed (standing steer + facing ticks steer only our entity)");
     }
+    // Body contact judged by the move (MoveFacingGuard). A failed hook
+    // leaves the stock rule, judged by the facing.
+    status = MH_CreateHook(reinterpret_cast<void*>(CONTACT_CIRCLE_ADDR),
+                           reinterpret_cast<void*>(&ContactCircleDetour),
+                           reinterpret_cast<void**>(&original_contact_circle));
+    if (status == MH_OK)
+        status = MH_EnableHook(reinterpret_cast<void*>(CONTACT_CIRCLE_ADDR));
+    if (status != MH_OK) {
+        probe::Log("movement: body-contact (circle) hook failed (%d)", (int)status);
+        original_contact_circle = nullptr;
+    }
+    status = MH_CreateHook(reinterpret_cast<void*>(CONTACT_BOX_ADDR),
+                           reinterpret_cast<void*>(&ContactBoxDetour),
+                           reinterpret_cast<void**>(&original_contact_box));
+    if (status == MH_OK)
+        status = MH_EnableHook(reinterpret_cast<void*>(CONTACT_BOX_ADDR));
+    if (status != MH_OK) {
+        probe::Log("movement: body-contact (box) hook failed (%d)", (int)status);
+        original_contact_box = nullptr;
+    }
+    if (original_contact_circle != nullptr && original_contact_box != nullptr)
+        probe::Log("movement: body-contact hooks installed (contact_by_move=%d)",
+                   vrmod::config.contact_by_move ? 1 : 0);
 }
 
 inline void ApplyRedirects() {

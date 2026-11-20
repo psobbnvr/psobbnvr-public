@@ -246,6 +246,17 @@ public:
             ShutdownInstanceOnly();
             return false;
         }
+        // The compositor's layer limit, for SubmitFrame's bound.
+        {
+            XrSystemProperties sprops = {XR_TYPE_SYSTEM_PROPERTIES};
+            runtime_max_layers_ =
+                XR_SUCCEEDED(xrGetSystemProperties(instance_, system_, &sprops))
+                    ? sprops.graphicsProperties.maxLayerCount
+                    : 0;
+            diag::Log("openxr: compositor accepts up to %u layers per frame "
+                      "(we submit at most %u)",
+                      runtime_max_layers_, kMaxSubmitLayers);
+        }
 
         // D3D11 device on the adapter the runtime demands (LUID-matched).
         PFN_xrGetD3D11GraphicsRequirementsKHR get_reqs = nullptr;
@@ -450,6 +461,13 @@ public:
         return true;
     }
 
+    // Every layer SubmitFrame can submit in one frame, worst case, in
+    // submission order (bottom to top): the menu below-quad, the projection
+    // layer, the HUD quad (or the menu above-quad, the same layer), the
+    // tuning readout, the teleport list, one quad per panel slot, and the
+    // two hand rays.
+    static constexpr uint32_t kMaxSubmitLayers = 5 + kPanelSlots + 2;
+
     bool SubmitFrame() override {
         if (!ready_ || !session_running_ || !frame_open_ ||
             wide_texture_ == nullptr || swapchain_[0] == XR_NULL_HANDLE)
@@ -491,8 +509,26 @@ public:
         layer.space = local_space_;
         layer.viewCount = 2;
         layer.views = proj_views;
-        const XrCompositionLayerBaseHeader* layers[8] = {};
+        const XrCompositionLayerBaseHeader* layers[kMaxSubmitLayers] = {};
         uint32_t layer_count = 0;
+        // Bounded by the array and by the runtime's limit; a layer past
+        // either is dropped (the topmost go first) and logged once rather
+        // than overrunning the array or failing xrEndFrame.
+        const uint32_t layer_cap =
+            (runtime_max_layers_ != 0 && runtime_max_layers_ < kMaxSubmitLayers)
+                ? runtime_max_layers_
+                : kMaxSubmitLayers;
+        auto add_layer = [&](const void* l) {
+            if (layer_count < layer_cap) {
+                layers[layer_count++] = (const XrCompositionLayerBaseHeader*)l;
+                return;
+            }
+            if (!layer_overflow_logged_) {
+                layer_overflow_logged_ = true;
+                diag::Log("openxr: more than %u composition layers in one frame "
+                          "- dropping the extra ones (logged once)", layer_cap);
+            }
+        };
 
         // Menu world-lock: a non-gameplay frame composites world-locked at
         // the menu anchor (the wearer's position + yaw, captured at menu
@@ -522,13 +558,13 @@ public:
             // span, so 3D content between the layers reads in front of the
             // backdrop and behind the UI, matching the compositing order.
             PlaceMenuQuad(below, config.menu_below_distance_m);
-            layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&below;
+            add_layer(&below);
         }
 
         if (menu_frame)
             layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         if (render_views_valid_)
-            layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&layer;
+            add_layer(&layer);
 
         // The HUD texture as its own quad layer above the world layer,
         // repositioned by the compositor every display refresh (a baked HUD
@@ -591,7 +627,7 @@ public:
                                   tanf(config.hud_width_deg * (3.14159265f / 360.0f));
                 quad.size.height = quad.size.width * (480.0f / 640.0f);
             }
-            layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&quad;
+            add_layer(&quad);
         }
 
         // Tuning readout (ShowTuneText): a small head-locked quad below the
@@ -619,8 +655,7 @@ public:
                 tune.size.width = 0.62f;
                 tune.size.height =
                     0.62f * (float)kTuneHeight / (float)kTuneWidth;
-                layers[layer_count++] =
-                    (const XrCompositionLayerBaseHeader*)&tune;
+                add_layer(&tune);
             }
         }
 
@@ -642,36 +677,45 @@ public:
             tele.pose.position = {0.0f, -0.05f, -1.1f};
             tele.size.width = 0.55f;
             tele.size.height = 0.55f * (float)kTeleHeight / (float)kTeleWidth;
-            layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&tele;
+            add_layer(&tele);
         }
 
-        // On-screen keyboard panel (ShowPanel): a quad pinned in LOCAL
-        // space at the pose captured when it opened, composited over
-        // everything while a text field is open.
-        XrCompositionLayerQuad panel = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-        if (panel_visible_ && panel_texture_ != nullptr &&
-            panel_swapchain_ != XR_NULL_HANDLE &&
-            CopyIntoSwapchain(panel_swapchain_, panel_swapchain_image_,
-                              panel_texture_)) {
+        // Panels (ShowPanel): quads at the pose their owner gave, composited
+        // over everything while shown. Highest slot first, so a lower slot
+        // (the keyboard) lands on top. A slot in a grip's action space is
+        // placed by the runtime from that controller's latest pose at each
+        // display refresh; without the space (no controller actions) it is
+        // not drawn, since its pose means nothing in LOCAL space.
+        XrCompositionLayerQuad panel_quads[kPanelSlots];
+        for (int slot = kPanelSlots - 1; slot >= 0; slot--) {
+            const Panel& p = panels_[slot];
+            XrCompositionLayerQuad& panel = panel_quads[slot];
+            panel = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            const XrSpace space =
+                p.space_hand < 0 ? local_space_ : grip_space_[p.space_hand];
+            if (!p.visible || p.texture == nullptr ||
+                p.swapchain == XR_NULL_HANDLE || space == XR_NULL_HANDLE ||
+                !CopyIntoSwapchain(p.swapchain, p.swapchain_image, p.texture))
+                continue;
             panel.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            panel.subImage.swapchain = panel_swapchain_;
+            panel.subImage.swapchain = p.swapchain;
             panel.subImage.imageRect = {
-                {0, 0}, {(int32_t)panel_width_, (int32_t)panel_height_}};
-            panel.space = local_space_;
-            panel.pose = panel_pose_;
-            panel.size.width = panel_width_m_;
-            panel.size.height =
-                panel_width_m_ * (float)panel_height_ / (float)panel_width_;
-            layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&panel;
+                {0, 0}, {(int32_t)p.width, (int32_t)p.height}};
+            panel.space = space;
+            panel.pose = p.pose;
+            panel.size.width = p.width_m;
+            panel.size.height = p.width_m * (float)p.height / (float)p.width;
+            add_layer(&panel);
         }
 
         // The keyboard's hand rays (SetPanelRay): one thin quad per hand
-        // over the shared beam texture, after the panel so they read on
-        // top of it, only while the panel is up.
+        // over the shared beam texture, after the panels so they read on
+        // top of them, only while the keyboard's panel is up.
         XrCompositionLayerQuad rays[2] = {{XR_TYPE_COMPOSITION_LAYER_QUAD},
                                           {XR_TYPE_COMPOSITION_LAYER_QUAD}};
-        if (panel_visible_ && (ray_visible_[0] || ray_visible_[1]) &&
+        if (panels_[kPanelKeyboard].visible &&
+            (ray_visible_[0] || ray_visible_[1]) &&
             EnsureRayTexture() &&
             CopyIntoSwapchain(ray_swapchain_, ray_swapchain_image_, ray_texture_)) {
             for (int h = 0; h < 2; h++) {
@@ -686,7 +730,7 @@ public:
                 q.pose = ray_pose_[h];
                 q.size.width = ray_width_[h];
                 q.size.height = ray_length_[h];
-                layers[layer_count++] = (const XrCompositionLayerBaseHeader*)&q;
+                add_layer(&q);
             }
         }
 
@@ -1003,29 +1047,44 @@ public:
         tele_visible_ = true;
     }
 
-    // On-screen keyboard panel (psobbvr_vrkeyboard.hpp): upload the
-    // caller's straight-alpha BGRA image into the panel texture (resources
-    // created lazily, recreated on a size change) and pin the quad at the
-    // given tracking-space pose. Render thread, like ShowMenuText.
-    void ShowPanel(const uint32_t* bgra, UINT width, UINT height,
+    // Panels (the keyboard, the spell wheel): upload the caller's
+    // straight-alpha BGRA image into the slot's texture (resources created
+    // lazily, recreated on a size change) and pin the quad at the given
+    // tracking-space pose. Render thread, like ShowMenuText.
+    void ShowPanel(int slot, const uint32_t* bgra, UINT width, UINT height,
                    const D3DMATRIX& pose_m, float width_m) override {
+        if (slot < 0 || slot >= kPanelSlots)
+            return;
         if (!ready_ || d3d11_device_ == nullptr || swapchain_format_ == 0 ||
             bgra == nullptr || width == 0 || height == 0)
             return;
-        if (panel_swapchain_ != XR_NULL_HANDLE &&
-            (panel_width_ != width || panel_height_ != height))
-            ReleasePanel();
-        if (panel_swapchain_ == XR_NULL_HANDLE) {
-            if (!CreateOneSwapchain(width, height, panel_swapchain_,
-                                    panel_swapchain_image_,
-                                    panel_swapchain_image_count_)) {
-                probe::Log("openxr: keyboard panel swapchain creation failed");
+        Panel& p = panels_[slot];
+        if (p.swapchain != XR_NULL_HANDLE &&
+            (p.width != width || p.height != height)) {
+            diag::Log("openxr: panel %d (%s) resized %ux%u -> %ux%u, recreating",
+                      slot, PanelName(slot), p.width, p.height, width, height);
+            ReleasePanel(slot);
+        }
+        if (p.swapchain == XR_NULL_HANDLE) {
+            if (!CreateOneSwapchain(width, height, p.swapchain,
+                                    p.swapchain_image,
+                                    p.swapchain_image_count)) {
+                // Once per slot until a creation succeeds: ShowPanel is
+                // re-called on every content change.
+                if (!p.failure_logged)
+                    diag::Log("openxr: panel %d (%s) swapchain creation failed (%ux%u)",
+                              slot, PanelName(slot), width, height);
+                p.failure_logged = true;
                 return;
             }
-            panel_width_ = width;
-            panel_height_ = height;
+            p.width = width;
+            p.height = height;
+            p.failure_logged = false;
+            diag::Log("openxr: panel %d (%s) swapchain created %ux%u (%u images)",
+                      slot, PanelName(slot), width, height,
+                      p.swapchain_image_count);
         }
-        if (panel_texture_ == nullptr) {
+        if (p.texture == nullptr) {
             D3D11_TEXTURE2D_DESC desc = {};
             desc.Width = width;
             desc.Height = height;
@@ -1036,21 +1095,60 @@ public:
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             if (FAILED(d3d11_device_->CreateTexture2D(&desc, nullptr,
-                                                      &panel_texture_))) {
-                probe::Log("openxr: keyboard panel texture creation failed");
+                                                      &p.texture))) {
+                p.texture = nullptr;
+                if (!p.failure_logged)
+                    diag::Log("openxr: panel %d (%s) texture creation failed (%ux%u)",
+                              slot, PanelName(slot), width, height);
+                p.failure_logged = true;
                 return;
             }
+            p.failure_logged = false;
         }
-        d3d11_context_->UpdateSubresource(panel_texture_, 0, nullptr, bgra,
+        d3d11_context_->UpdateSubresource(p.texture, 0, nullptr, bgra,
                                           width * 4, 0);
-        panel_pose_ = ToXrPose(pose_m);
-        panel_width_m_ = width_m;
-        panel_visible_ = true;
+        p.pose = ToXrPose(pose_m);
+        p.width_m = width_m;
+        p.visible = true;
     }
 
-    void HidePanel() override {
-        panel_visible_ = false;
-        ray_visible_[0] = ray_visible_[1] = false;
+    void HidePanel(int slot) override {
+        if (slot < 0 || slot >= kPanelSlots)
+            return;
+        panels_[slot].visible = false;
+        // The rays are the keyboard's: they go with its panel only.
+        if (slot == kPanelKeyboard)
+            ray_visible_[0] = ray_visible_[1] = false;
+    }
+
+    void SetPanelPose(int slot, const D3DMATRIX& pose_m) override {
+        if (slot < 0 || slot >= kPanelSlots)
+            return;
+        panels_[slot].pose = ToXrPose(pose_m);
+    }
+
+    void SetPanelSpace(int slot, int hand) override {
+        if (slot < 0 || slot >= kPanelSlots)
+            return;
+        if (hand < -1 || hand > 1)
+            hand = -1;
+        Panel& p = panels_[slot];
+        if (p.space_hand == hand)
+            return;
+        p.space_hand = hand;
+        diag::Log("openxr: panel %d (%s) placed in %s", slot, PanelName(slot),
+                  hand < 0 ? "tracking space" : hand == 0 ? "the left grip's space"
+                                                          : "the right grip's space");
+    }
+
+    bool PanelVisible(int slot) const override {
+        return slot >= 0 && slot < kPanelSlots && panels_[slot].visible;
+    }
+
+    static const char* PanelName(int slot) {
+        return slot == kPanelKeyboard ? "keyboard"
+             : slot == kPanelWheel    ? "wheel"
+                                      : "?";
     }
 
     // The keyboard's hand rays: remember each hand's beam for EndFrame.
@@ -1131,20 +1229,29 @@ public:
         ray_visible_[0] = ray_visible_[1] = false;
     }
 
-    void ReleasePanel() {
-        ReleaseRays();
-        if (panel_swapchain_ != XR_NULL_HANDLE) {
-            xrDestroySwapchain(panel_swapchain_);
-            panel_swapchain_ = XR_NULL_HANDLE;
+    // Free one slot's swapchain and texture and hide it. The keyboard's
+    // slot takes the rays with it.
+    void ReleasePanel(int slot) {
+        if (slot < 0 || slot >= kPanelSlots)
+            return;
+        if (slot == kPanelKeyboard)
+            ReleaseRays();
+        Panel& p = panels_[slot];
+        const bool had = p.swapchain != XR_NULL_HANDLE || p.texture != nullptr;
+        if (p.swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(p.swapchain);
+            p.swapchain = XR_NULL_HANDLE;
         }
-        panel_swapchain_image_count_ = 0;
-        memset(panel_swapchain_image_, 0, sizeof(panel_swapchain_image_));
-        if (panel_texture_ != nullptr) {
-            panel_texture_->Release();
-            panel_texture_ = nullptr;
+        p.swapchain_image_count = 0;
+        memset(p.swapchain_image, 0, sizeof(p.swapchain_image));
+        if (p.texture != nullptr) {
+            p.texture->Release();
+            p.texture = nullptr;
         }
-        panel_width_ = panel_height_ = 0;
-        panel_visible_ = false;
+        p.width = p.height = 0;
+        p.visible = false;
+        if (had)
+            diag::Log("openxr: panel %d (%s) released", slot, PanelName(slot));
     }
 
     // Game-convention rigid transform (row-vector, translation in meters)
@@ -1729,10 +1836,45 @@ private:
         return copied;
     }
 
+    // A Segoe UI font `height` pixels tall, made smaller (down to half)
+    // where `text` would not fit max_width at that size: DrawText clips a
+    // centered line on both sides. Grayscale antialiasing, not ClearType -
+    // subpixel color fringes would survive into the readout's coverage
+    // read.
+    static HFONT CreateFittedFont(HDC dc, const char* text, int height,
+                                  int weight, LONG max_width) {
+        const int min_height = height / 2;
+        for (;;) {
+            HFONT font = CreateFontA(
+                -height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+            if (font == nullptr || text == nullptr || height <= min_height)
+                return font;
+            HGDIOBJ prev = SelectObject(dc, font);
+            SIZE size = {};
+            const BOOL measured =
+                GetTextExtentPoint32A(dc, text, (int)strlen(text), &size);
+            SelectObject(dc, prev);
+            if (!measured || size.cx <= max_width)
+                return font;
+            DeleteObject(font);
+            // The width follows the height nearly in proportion; a further
+            // pass catches the rounding.
+            int next = (int)((long long)height * max_width / size.cx);
+            if (next >= height)
+                next = height - 1;
+            if (next < min_height)
+                next = min_height;
+            height = next;
+        }
+    }
+
     // Tuning readout: GDI-render line1/line2 white-on-dark into the tune
-    // texture. Text is composited on the CPU over a 55%-black backing and
-    // stored as straight alpha (SteamVR multiplies rgb*alpha). Gray values
-    // make the BGRA/RGBA channel order irrelevant.
+    // texture, each line's font shrunk to fit the width. Text is
+    // composited on the CPU over a 55%-black backing and stored as
+    // straight alpha (SteamVR multiplies rgb*alpha). Gray values make the
+    // BGRA/RGBA channel order irrelevant.
     void RasterizeTuneText(const char* line1, const char* line2) {
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
@@ -1755,16 +1897,11 @@ private:
         memset(bits, 0, kTuneWidth * kTuneHeight * 4);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        // Grayscale antialiasing, not ClearType - subpixel color fringes
-        // would survive into the coverage read below.
-        HFONT title_font = CreateFontA(
-            -30, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-        HFONT value_font = CreateFontA(
-            -52, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        const LONG text_width = (LONG)kTuneWidth - 16;
+        HFONT title_font =
+            CreateFittedFont(dc, line1, 30, FW_SEMIBOLD, text_width);
+        HFONT value_font =
+            CreateFittedFont(dc, line2, 52, FW_BOLD, text_width);
         RECT title_rc = {0, 4, (LONG)kTuneWidth, 44};
         RECT value_rc = {0, 44, (LONG)kTuneWidth, (LONG)kTuneHeight - 4};
         HGDIOBJ old_font = SelectObject(dc, title_font);
@@ -2069,7 +2206,8 @@ private:
             tele_texture_ = nullptr;
         }
         tele_visible_ = false;
-        ReleasePanel();
+        for (int slot = 0; slot < kPanelSlots; slot++)
+            ReleasePanel(slot);
     }
 
     void ReleaseEyeTextures() {
@@ -2180,19 +2318,24 @@ private:
     bool hud_anchor_valid_ = false;
     float hud_anchor_fx_ = 0.0f, hud_anchor_fz_ = -1.0f;
 
-    // On-screen keyboard panel (ShowPanel): a caller-rasterized image in
-    // its own texture + quad swapchain, pinned in LOCAL space at
-    // panel_pose_ while panel_visible_.
-    XrSwapchain panel_swapchain_ = XR_NULL_HANDLE;
-    ID3D11Texture2D* panel_swapchain_image_[8] = {};  // runtime-owned
-    uint32_t panel_swapchain_image_count_ = 0;
-    ID3D11Texture2D* panel_texture_ = nullptr;
-    UINT panel_width_ = 0, panel_height_ = 0;
-    bool panel_visible_ = false;
-    XrPosef panel_pose_ = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
-    float panel_width_m_ = 0.8f;
+    // Panel slots (ShowPanel): each a caller-rasterized image in its own
+    // texture + quad swapchain, at `pose` while `visible`: in LOCAL space,
+    // or relative to a hand's grip action space (SetPanelSpace).
+    struct Panel {
+        XrSwapchain swapchain = XR_NULL_HANDLE;
+        ID3D11Texture2D* swapchain_image[8] = {};  // runtime-owned
+        uint32_t swapchain_image_count = 0;
+        ID3D11Texture2D* texture = nullptr;
+        UINT width = 0, height = 0;
+        bool visible = false;
+        int space_hand = -1;  // -1 = LOCAL space, 0 / 1 = grip_space_[hand]
+        XrPosef pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        float width_m = 0.8f;
+        bool failure_logged = false;
+    };
+    Panel panels_[kPanelSlots];
     // The keyboard's hand rays (SetPanelRay): two quads over one beam
-    // texture, drawn only while the panel is up.
+    // texture, drawn only while the keyboard's panel is up.
     XrSwapchain ray_swapchain_ = XR_NULL_HANDLE;
     ID3D11Texture2D* ray_swapchain_image_[8] = {};  // runtime-owned
     uint32_t ray_swapchain_image_count_ = 0;
@@ -2258,6 +2401,12 @@ private:
     XrResult last_submit_error_ = XR_SUCCESS;
     uint32_t submit_count_ = 0;
     DWORD submit_window_start_ = 0;
+    // The runtime's composition layer limit (XrSystemGraphicsProperties;
+    // 0 = unread, and kMaxSubmitLayers alone bounds a frame - the core
+    // spec guarantees at least 16) and whether a frame has already had to
+    // drop layers past the bound.
+    uint32_t runtime_max_layers_ = 0;
+    bool layer_overflow_logged_ = false;
     bool ready_ = false;
     char status_[192] = "VR not started (OpenXR)";
 };

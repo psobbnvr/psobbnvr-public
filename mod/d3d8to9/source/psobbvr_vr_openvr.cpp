@@ -145,6 +145,7 @@ void LoadConfig() {
     read_float("turn_speed_scale", 0.049f, 1.001f, config.turn_speed_scale);
     config.back_strafe = settings::GetInt("vr", "back_strafe", 1, path) != 0;
     read_float("back_speed_scale", 0.299f, 1.001f, config.back_speed_scale);
+    config.contact_by_move = settings::GetInt("vr", "contact_by_move", 1, path) != 0;
     config.side_turn = settings::GetInt("vr", "side_turn", 1, path) != 0;
     read_float("side_turn_speed_scale", 0.009f, 1.001f, config.side_turn_speed_scale);
     read_float("trim_radius_m", 0.01f, 2.0f, config.trim_radius_m);
@@ -165,6 +166,18 @@ void LoadConfig() {
         settings::GetInt("vr", "cast_left_hand", 1, path) != 0;
     config.cast_facing_snap =
         settings::GetInt("vr", "cast_facing_snap", 0, path) != 0;
+    config.cast_aim_point =
+        settings::GetInt("vr", "cast_aim_point", 1, path) != 0;
+    read_float("cast_aim_point_dist", 0.999f, 10000.001f,
+               config.cast_aim_point_dist);
+    config.cast_aim_ray =
+        settings::GetInt("vr", "cast_aim_ray", 1, path) != 0 ? 1 : 0;
+    read_float("cast_aim_shoulder_down_m", -0.501f, 0.801f,
+               config.cast_aim_shoulder_down_m);
+    read_float("cast_aim_shoulder_side_m", -0.501f, 0.801f,
+               config.cast_aim_shoulder_side_m);
+    read_float("cast_aim_shoulder_back_m", -0.501f, 0.801f,
+               config.cast_aim_shoulder_back_m);
     read_float("cast_aim_cone_deg", 4.999f, 90.001f,
                config.cast_aim_cone_deg);
     // -1 = auto, else a tech-id bitmask (see Config::cast_aim_techs);
@@ -307,6 +320,8 @@ void LoadConfig() {
     // Photon swing trails (see Config::weapon_trail).
     config.weapon_trail = settings::GetInt("vr", "weapon_trail", 1, path) != 0;
     read_float("weapon_trail_speed", 0.099f, 20.001f, config.weapon_trail_speed);
+    config.weapon_trail_moving = settings::GetInt("vr", "weapon_trail_moving", 1, path) != 0;
+    config.weapon_trail_blend = settings::GetInt("vr", "weapon_trail_blend", 1, path) != 0;
     // Motion-controlled hands (psobbvr_hands.hpp).
     config.hand_presence = settings::GetInt("vr", "hand_presence", 1, path) != 0;
     read_float("hand_scale", 0.099f, 2.001f, config.hand_scale);
@@ -321,6 +336,58 @@ void LoadConfig() {
     read_float("grip_yaw_deg", -180.001f, 180.001f, config.grip_yaw_deg);
     read_float("grip_fwd_cm", -50.001f, 50.001f, config.grip_fwd_cm);
     read_float("grip_up_cm", -50.001f, 50.001f, config.grip_up_cm);
+    read_float("melee_slide_cm", -30.001f, 30.001f, config.melee_slide_cm);
+    read_float("melee_side_cm", -30.001f, 30.001f, config.melee_side_cm);
+    read_float("melee_pitch_deg", -90.001f, 90.001f, config.melee_pitch_deg);
+    read_float("melee_angle_follow", -0.001f, 1.001f, config.melee_angle_follow);
+    config.melee_angle_follow = config.melee_angle_follow < 0.0f ? 0.0f
+                                 : config.melee_angle_follow > 1.0f ? 1.0f
+                                                                    : config.melee_angle_follow;
+    config.hand_close = settings::GetInt("vr", "hand_close", 1, path) != 0 ? 1 : 0;
+    read_float("hand_close_gap_cm", -0.001f, 5.001f, config.hand_close_gap_cm);
+    read_float("hand_close_reach_cm", -0.001f, 20.001f, config.hand_close_reach_cm);
+    read_float("hand_close_cap_cm", -0.001f, 10.001f, config.hand_close_cap_cm);
+    read_float("hand_close_fade_cm", -0.001f, 20.001f, config.hand_close_fade_cm);
+    config.hand_fit = settings::GetInt("vr", "hand_fit", 1, path) != 0 ? 1 : 0;
+    // The rule where nothing clears: "rest" (as the game has it) or "least"
+    // (the least bad); any other value keeps the default.
+    auto read_unclear = [&](const char *key, int &out) {
+        if (settings::GetString("vr", key, "", value, sizeof(value), path)) {
+            if (_stricmp(value, "rest") == 0)
+                out = 1;
+            else if (_stricmp(value, "least") == 0)
+                out = 0;
+        }
+    };
+    read_unclear("hand_fit_fingers_unclear", config.hand_fit_fingers_unclear);
+    read_unclear("hand_fit_thumb_unclear", config.hand_fit_thumb_unclear);
+    // The share of the limit the least bad angle (slide) may take, 0..1, read
+    // as a double; anything but a number in 0..1 keeps the default.
+    auto read_share = [&](const char *key, double &out) {
+        if (settings::GetString("vr", key, "", value, sizeof(value), path)) {
+            char *end = nullptr;
+            const double parsed = strtod(value, &end);
+            if (end != value && parsed >= 0.0 && parsed <= 1.0)
+                out = parsed;
+        }
+    };
+    read_share("hand_fit_fingers_unclear_limit", config.hand_fit_fingers_unclear_limit);
+    read_share("hand_fit_thumb_unclear_limit", config.hand_fit_thumb_unclear_limit);
+    // 1 lets each finger block take its own angle; any other value keeps one
+    // angle for both.
+    config.hand_fit_fingers_each = settings::GetInt("vr", "hand_fit_fingers_each", 1, path) == 1 ? 1 : 0;
+    // 1 moves the hand onto the gun; any other value leaves it where it is.
+    config.gun_seat = settings::GetInt("vr", "gun_seat", 1, path) == 1 ? 1 : 0;
+    // 1 keeps the melee weapon on the controller's line and moves the hand
+    // onto it; any other value leaves the hand where it is.
+    config.melee_hand_seat = settings::GetInt("vr", "melee_hand_seat", 1, path) == 1 ? 1 : 0;
+    // 1 places a held gun from the hand (with gun_seat); any other value
+    // leaves the gun on its grip tuple.
+    config.gun_to_hand = settings::GetInt("vr", "gun_to_hand", 1, path) == 1 ? 1 : 0;
+    read_float("gun_hand_pitch_deg", -90.001f, 90.001f, config.gun_hand_pitch_deg);
+    // 1 puts an empty hand where it holds a weapon; any other value leaves it
+    // on the bare hand's frame.
+    config.bare_hand_on_line = settings::GetInt("vr", "bare_hand_on_line", 1, path) == 1 ? 1 : 0;
     read_float("gun_pitch_deg", -180.001f, 180.001f, config.gun_pitch_deg);
     read_float("gun_roll_deg", -180.001f, 180.001f, config.gun_roll_deg);
     read_float("gun_yaw_deg", -180.001f, 180.001f, config.gun_yaw_deg);
@@ -334,7 +401,7 @@ void LoadConfig() {
     read_float("fist_side_cm", -50.001f, 50.001f, config.fist_side_cm);
     // IK arms (psobbvr_ikarms.hpp).
     {
-        const int ik = settings::GetInt("vr", "ik_arms", 0, path);
+        const int ik = settings::GetInt("vr", "ik_arms", 1, path);
         if (ik >= 0 && ik <= 2)
             config.ik_arms = ik;
     }
@@ -346,16 +413,38 @@ void LoadConfig() {
     read_float("ik_shoulder_fwd_cm", -30.001f, 30.001f, config.ik_shoulder_fwd_cm);
     read_float("ik_shoulder_in_cm", -30.001f, 30.001f, config.ik_shoulder_in_cm);
     read_float("ik_twist", -0.001f, 1.001f, config.ik_twist);
+    config.ik_elbow = settings::GetInt("vr", "ik_elbow", 1, path) != 0 ? 1 : 0;
+    read_float("ik_elbow_gain", -2.001f, 2.001f, config.ik_elbow_gain);
+    read_float("ik_elbow_dead_deg", -0.001f, 180.001f, config.ik_elbow_dead_deg);
+    read_float("ik_elbow_max_deg", -0.001f, 120.001f, config.ik_elbow_max_deg);
+    read_float("ik_elbow_center_deg", -180.001f, 180.001f, config.ik_elbow_center_deg);
+    read_float("ik_elbow_rate_dps", 9.999f, 3600.001f, config.ik_elbow_rate_dps);
     {
         const int anchor = settings::GetInt("vr", "ik_anchor", 2, path);
         if (anchor >= 0 && anchor <= 2)
             config.ik_anchor = anchor;
+        const int idle_hold = settings::GetInt("vr", "ik_idle_hold", 2, path);
+        if (idle_hold >= 0 && idle_hold <= 2)
+            config.ik_idle_hold = idle_hold;
     }
     read_float("ik_neck_down_cm", -30.001f, 30.001f, config.ik_neck_down_cm);
     read_float("ik_neck_back_cm", -30.001f, 30.001f, config.ik_neck_back_cm);
     read_float("ik_reach_cm", 29.999f, 120.001f, config.ik_reach_cm);
     read_float("ik_arm_match", -0.001f, 1.001f, config.ik_arm_match);
     read_float("ik_stretch_max", -0.001f, 0.501f, config.ik_stretch_max);
+    {
+        const int torso = settings::GetInt("vr", "ik_torso", 1, path);
+        if (torso >= 0 && torso <= 1)
+            config.ik_torso = torso;
+    }
+    read_float("ik_torso_max_deg", -0.001f, 180.001f, config.ik_torso_max_deg);
+    read_float("ik_torso_neck_deg", 9.999f, 180.001f, config.ik_torso_neck_deg);
+    read_float("ik_torso_smooth_s", 0.0099f, 5.001f, config.ik_torso_smooth_s);
+    read_float("ik_torso_hands", -0.001f, 1.001f, config.ik_torso_hands);
+    read_float("ik_torso_hands_near_m", -0.001f, 1.001f, config.ik_torso_hands_near_m);
+    read_float("ik_torso_hands_far_m", 0.0099f, 1.501f, config.ik_torso_hands_far_m);
+    read_float("ik_torso_neck_back_m", -0.001f, 0.501f, config.ik_torso_neck_back_m);
+    read_float("ik_torso_rate_dps", 9.999f, 2000.001f, config.ik_torso_rate_dps);
 
     // Launch summary for bug reports: the build, the ini values that shape
     // a session, and the files the VR path depends on (psobbvr-vr.log).

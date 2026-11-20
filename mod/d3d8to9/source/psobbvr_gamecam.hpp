@@ -100,6 +100,9 @@ constexpr float MIN_HORIZONTAL = 0.09f;  // ~ +/-85 degrees
 // wearer's current head position on the character's eye point.
 inline bool anchor_valid = false;
 inline bool want_recenter = true;
+// Counts anchor captures, so a consumer of the tracked pose can tell the
+// forward was re-captured.
+inline unsigned recenter_count = 0;
 inline float anchor_dx = 0.0f, anchor_dz = -1.0f;
 inline float anchor_p0[3] = {};
 // The wearer's yaw at capture, tracking space, unit xz ((0,-1) = tracking
@@ -280,6 +283,16 @@ inline int32_t follow_pending_target = 0;  // the facing it lands on (16-bit)
 // the attack hold taking a snap). Consumed by that Apply.
 inline int32_t snap_preview = 0;
 inline bool snap_view = false;
+
+// Counts the placements where the view jumped instead of moving: a new
+// anchor (spawn, recenter), a snap turn, or the character warping. For
+// code that measures motion through the world from one frame to the next.
+inline unsigned view_jumps = 0;
+// The yaw follow landing at once on a target closer than this (cosine,
+// 3 degrees) is not a jump.
+constexpr float VIEW_JUMP_COS = 0.99863f;
+// A horizontal feet step above this (units, per placement) is a warp.
+constexpr float WARP_STEP = 5.0f;
 
 // The look direction Apply writes into the camera, as a facing-style BAMS
 // angle (direction (sin, cos)); valid while written_this_frame.
@@ -581,6 +594,8 @@ inline void Apply() {
         hud_reseed = true;
         anchor_valid = true;
         want_recenter = false;
+        recenter_count++;
+        view_jumps++;
         diag::Log("gamecam: anchor facing=%d (theta %.1f deg) fwd=(%.3f,%.3f) headyaw=(%.3f,%.3f) feet=(%.1f,%.1f,%.1f)%s",
                   facing_bams, theta * 57.2958f,
                   anchor_dx, anchor_dz, anchor_hx, anchor_hz,
@@ -660,6 +675,8 @@ inline void Apply() {
         }
         // Jump: a late placement turn, or a snap turn, lands at once.
         if (warming || snap_view) {
+            if (follow_dx * target_fx + follow_dz * target_fz < VIEW_JUMP_COS)
+                view_jumps++;
             follow_dx = target_fx;
             follow_dz = target_fz;
             snap_view = false;
@@ -748,23 +765,28 @@ inline void Apply() {
     world_from_head._42 -= world_from_head._32 * fwd_units;
     world_from_head._43 -= world_from_head._33 * fwd_units;
 
+    // The feet's step since the last placement. A warp is a jump of the
+    // view, not locomotion.
+    float step = 0.0f;
+    if (prev_feet_valid) {
+        const float sdx = feet[0] - prev_feet[0];
+        const float sdz = feet[2] - prev_feet[2];
+        step = sqrtf(sdx * sdx + sdz * sdz);
+        if (step > WARP_STEP) {
+            step = 0.0f;
+            view_jumps++;
+        }
+    }
+    prev_feet[0] = feet[0];
+    prev_feet[1] = feet[1];
+    prev_feet[2] = feet[2];
+    prev_feet_valid = true;
+
     // Run lean: the run animation puts the head forward of and below the
     // standing eye point, so shift the camera along the facing and down by
     // run_down_m, ramped by smoothed feet speed. Warps are ignored.
     if (vrmod::config.run_forward_m != 0.0f ||
         vrmod::config.run_down_m != 0.0f) {
-        float step = 0.0f;
-        if (prev_feet_valid) {
-            const float sdx = feet[0] - prev_feet[0];
-            const float sdz = feet[2] - prev_feet[2];
-            step = sqrtf(sdx * sdx + sdz * sdz);
-            if (step > 5.0f)  // warp, not locomotion
-                step = 0.0f;
-        }
-        prev_feet[0] = feet[0];
-        prev_feet[1] = feet[1];
-        prev_feet[2] = feet[2];
-        prev_feet_valid = true;
         run_smooth += (step - run_smooth) * RUN_ALPHA;
         float lean = run_smooth / RUN_STEP_FULL;
         if (lean > 1.0f)

@@ -20,6 +20,7 @@
 
 #include "psobbvr_bindings_core.hpp"
 #include "psobbvr_log.hpp"
+#include "psobbvr_wheel_config.hpp"
 
 // d3d8's own export (d3d8to9.cpp) - the same recenter the panel button
 // calls.
@@ -138,9 +139,12 @@ inline void Load(const char* why) {
     Reset();
     initialized = true;
     Dump();
+    // The spell wheel's [wheel] section loads and reloads with this one.
+    wheelconfig::Load(ini_path, why);
 }
 
-// Once per mapper call: lazy first load, then the write-time poll.
+// Once per mapper call, with or without controller input: lazy first
+// load, then the write-time poll.
 inline void Poll() {
     if (!initialized) {
         Load("startup");

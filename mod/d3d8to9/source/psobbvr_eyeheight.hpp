@@ -20,7 +20,9 @@
 // cannot be read.
 //
 // Used by gamecam::Apply (eye point) and trim::OnFrame (learn-zone
-// anchor), both gated on [vr] eye_height_auto.
+// anchor), both gated on [vr] eye_height_auto. The same blend gives the
+// right fist's channel, the line a melee weapon's handle rests along
+// (weapongrip::MeleeSlide).
 
 #include <algorithm>
 #include <cmath>
@@ -99,10 +101,69 @@ constexpr float PROPORTION_SHAPE_HEIGHTS[12][7] = {
     {16.0000f, 16.0300f, 15.7275f, 14.5409f, 12.1881f, 12.1506f, 12.1103f},  // RAmarl
 };
 
-// The character the seed was computed for (entity, class byte and pair)
-// and its standing head height in units.
+// BEGIN hand tables (generated)
+// The fist channel of each class's seven proportion shape bodies: the line
+// a round handle rests along in the closed right hand, in the grip point's
+// rest frame (bone 48: +x out of the palm, -y from the wrist toward the
+// fingers, +z the thumb side), game units. The point is where the line
+// crosses z = 0 (x, y); the direction is a unit vector with z positive.
+// Generated: do not edit by hand.
+constexpr float PROPORTION_SHAPE_HOLE_POINT[12][7][2] = {
+    {{0.05360f, 0.03610f}, {0.03510f, -0.24690f}, {0.03250f, -0.13500f}, {0.04070f, 0.00680f}, {-0.08670f, -0.07440f}, {0.00490f, 0.03730f}, {0.12080f, -0.01020f}},  // HUmar
+    {{-0.15110f, -0.31390f}, {-0.14150f, -0.19090f}, {-0.06440f, -0.38520f}, {-0.06010f, -0.21620f}, {-0.07550f, -0.19470f}, {0.01510f, -0.18870f}, {0.06480f, -0.24360f}},  // HUnewearl
+    {{-0.23110f, -0.05170f}, {-0.00630f, -0.21710f}, {-0.06070f, -0.42820f}, {0.00670f, 0.28620f}, {-0.14990f, 0.04670f}, {-0.05640f, 0.02970f}, {0.02580f, 0.02770f}},  // HUcast
+    {{0.10090f, 0.06760f}, {0.05070f, 0.06520f}, {0.07240f, 0.18530f}, {0.03650f, 0.07920f}, {0.02700f, 0.07710f}, {0.11140f, 0.15250f}, {0.11230f, 0.28710f}},  // RAmar
+    {{-0.02460f, 0.30680f}, {0.16300f, 0.13570f}, {0.18990f, 0.09330f}, {0.17810f, 0.04540f}, {-0.01860f, -0.09950f}, {0.14990f, 0.14900f}, {0.27940f, 0.29470f}},  // RAcast
+    {{0.15580f, 0.33400f}, {0.25200f, 0.42300f}, {0.11850f, 0.39780f}, {0.06310f, 0.22050f}, {0.05340f, 0.20190f}, {0.04880f, 0.20840f}, {0.11440f, 0.31620f}},  // RAcaseal
+    {{-0.05050f, -0.24020f}, {-0.07150f, -0.08070f}, {-0.09140f, -0.08360f}, {-0.06090f, -0.09610f}, {-0.03240f, -0.02840f}, {-0.03930f, -0.03660f}, {-0.05210f, -0.00980f}},  // FOmarl
+    {{0.15540f, -0.06330f}, {0.15540f, -0.11470f}, {0.08920f, -0.10650f}, {0.15800f, -0.10770f}, {0.12850f, -0.04140f}, {0.04770f, -0.16450f}, {0.07770f, -0.25660f}},  // FOnewm
+    {{-0.02170f, -0.06820f}, {0.05220f, 0.15240f}, {-0.04920f, -0.07470f}, {-0.02600f, -0.05020f}, {-0.01570f, -0.07520f}, {0.06030f, -0.01750f}, {-0.05340f, -0.03390f}},  // FOnewearl
+    {{0.09100f, -0.12440f}, {0.00920f, -0.09210f}, {0.22190f, -0.11850f}, {0.01690f, -0.06510f}, {0.09040f, -0.03240f}, {0.10150f, 0.04480f}, {0.05590f, -0.00350f}},  // HUcaseal
+    {{0.06020f, -0.35850f}, {0.05560f, -0.12900f}, {0.08190f, -0.17330f}, {0.06170f, -0.26060f}, {0.03450f, 0.23090f}, {0.06580f, 0.08590f}, {0.18820f, -0.10810f}},  // FOmar
+    {{0.04850f, -0.30280f}, {-0.00720f, -0.38350f}, {0.10630f, -0.03900f}, {0.06120f, -0.27110f}, {0.21560f, -0.15860f}, {0.12300f, -0.27620f}, {0.00840f, -0.22700f}},  // RAmarl
+};
+
+constexpr float PROPORTION_SHAPE_HOLE_DIR[12][7][3] = {
+    {{0.00750f, -0.20120f, 0.97950f}, {0.10240f, -0.29730f, 0.94930f}, {0.01410f, -0.26290f, 0.96470f}, {-0.00500f, -0.20160f, 0.97950f}, {0.00270f, -0.20240f, 0.97930f}, {0.00600f, -0.20040f, 0.97970f}, {0.04290f, -0.23790f, 0.97040f}},  // HUmar
+    {{-0.02710f, -0.34670f, 0.93760f}, {-0.01560f, -0.38280f, 0.92370f}, {-0.00840f, -0.21040f, 0.97760f}, {-0.03650f, -0.36100f, 0.93190f}, {-0.04230f, -0.40260f, 0.91440f}, {-0.01300f, -0.38200f, 0.92410f}, {0.01440f, -0.34590f, 0.93820f}},  // HUnewearl
+    {{-0.00380f, -0.24560f, 0.96940f}, {0.03530f, -0.27160f, 0.96180f}, {0.14370f, -0.43520f, 0.88880f}, {0.00180f, -0.23210f, 0.97270f}, {0.00050f, -0.22250f, 0.97490f}, {0.00230f, -0.24270f, 0.97010f}, {0.00640f, -0.24680f, 0.96900f}},  // HUcast
+    {{0.00200f, -0.18240f, 0.98320f}, {0.00530f, -0.26870f, 0.96320f}, {0.00420f, -0.26250f, 0.96490f}, {0.01320f, -0.24720f, 0.96890f}, {0.01190f, -0.24050f, 0.97060f}, {0.01420f, -0.30870f, 0.95110f}, {-0.43030f, -0.12520f, 0.89400f}},  // RAmar
+    {{0.19420f, -0.11360f, 0.97440f}, {0.25240f, -0.01580f, 0.96750f}, {0.05970f, -0.09980f, 0.99320f}, {0.12740f, -0.14130f, 0.98170f}, {0.00050f, -0.15060f, 0.98860f}, {0.27350f, -0.05070f, 0.96050f}, {0.31450f, 0.00690f, 0.94920f}},  // RAcast
+    {{-0.47610f, -0.14300f, 0.86770f}, {-0.59190f, -0.12770f, 0.79580f}, {-0.35110f, -0.16180f, 0.92230f}, {-0.26310f, -0.19010f, 0.94580f}, {-0.31000f, -0.17440f, 0.93460f}, {-0.20760f, -0.17860f, 0.96180f}, {-0.43810f, -0.12450f, 0.89020f}},  // RAcaseal
+    {{-0.20010f, -0.03350f, 0.97920f}, {-0.20020f, -0.02310f, 0.97950f}, {-0.11980f, -0.07340f, 0.99010f}, {-0.19390f, -0.03360f, 0.98040f}, {-0.19200f, -0.06190f, 0.97940f}, {-0.19900f, -0.05850f, 0.97820f}, {-0.09280f, -0.09810f, 0.99080f}},  // FOmarl
+    {{-0.01360f, -0.34220f, 0.93950f}, {-0.01270f, -0.36160f, 0.93230f}, {-0.00600f, -0.39910f, 0.91690f}, {-0.02130f, -0.35290f, 0.93540f}, {-0.00580f, -0.34270f, 0.93940f}, {-0.01130f, -0.36190f, 0.93220f}, {0.00510f, -0.41650f, 0.90910f}},  // FOnewm
+    {{-0.21530f, -0.07020f, 0.97400f}, {0.12990f, -0.20970f, 0.96910f}, {-0.18010f, -0.04170f, 0.98280f}, {-0.17840f, -0.09310f, 0.97950f}, {-0.21160f, -0.09900f, 0.97230f}, {-0.18830f, -0.09410f, 0.97760f}, {-0.17670f, -0.06030f, 0.98240f}},  // FOnewearl
+    {{0.05660f, -0.32380f, 0.94440f}, {0.00550f, -0.26660f, 0.96380f}, {0.01180f, -0.35750f, 0.93380f}, {0.00270f, -0.25640f, 0.96660f}, {0.07090f, -0.31730f, 0.94570f}, {0.03290f, -0.26240f, 0.96440f}, {0.03260f, -0.38400f, 0.92270f}},  // HUcaseal
+    {{-0.15730f, 0.07640f, 0.98460f}, {-0.19220f, 0.08380f, 0.97780f}, {-0.19880f, 0.13700f, 0.97040f}, {-0.14210f, 0.04240f, 0.98890f}, {-0.03910f, -0.24240f, 0.96940f}, {-0.09610f, -0.06370f, 0.99330f}, {-0.10310f, -0.14470f, 0.98410f}},  // FOmar
+    {{0.02170f, -0.28950f, 0.95690f}, {0.02160f, -0.31350f, 0.94940f}, {0.05990f, -0.29400f, 0.95390f}, {0.00810f, -0.26700f, 0.96370f}, {0.25510f, 0.10120f, 0.96160f}, {0.04250f, -0.40440f, 0.91360f}, {0.07540f, -0.27180f, 0.95940f}},  // RAmarl
+};
+
+// The shape whose channel direction the build's change is measured from:
+// the class's default-proportions body.
+constexpr int HOLE_ANCHOR_SHAPE = 3;
+
+// In a sector whose corners do not include shape 1, the FOmar's hand
+// keeps the class file's node scale, so it blends from these rows there.
+constexpr float PROPORTION_SHAPE_HOLE_POINT_FOMAR_KEPT[7][2] = {{0.07350f, -0.20400f}, {0.05560f, -0.12900f}, {0.09150f, -0.05260f}, {0.06900f, -0.13630f}, {0.03450f, 0.23090f}, {0.06580f, 0.08590f}, {0.18820f, -0.10810f}};
+constexpr float PROPORTION_SHAPE_HOLE_DIR_FOMAR_KEPT[7][3] = {{-0.12830f, 0.03430f, 0.99110f}, {-0.19220f, 0.08380f, 0.97780f}, {-0.16900f, 0.03960f, 0.98480f}, {-0.14520f, 0.01400f, 0.98930f}, {-0.03910f, -0.24240f, 0.96940f}, {-0.09610f, -0.06370f, 0.99330f}, {-0.10310f, -0.14470f, 0.98410f}};
+// END hand tables (generated)
+
+// The hand used when there is no proportion seed: the HUmar's
+// default-proportions body, shape 3 (the pad's centre corner).
+constexpr int REFERENCE_HAND_CLASS = 0;
+constexpr int REFERENCE_HAND_SHAPE = 3;
+// The FOmar's class byte and the shape whose sectors blend its glove scale.
+constexpr int FOMAR_CLASS = 10;
+constexpr int FOMAR_SCALED_SHAPE = 1;
+
+// The character the seed was computed for (entity, class byte and pair),
+// its standing head height in units, and its right hand's fist channel
+// (the channel tables blended the same way).
 inline bool seed_valid = false;
 inline float seed_units = 0.0f;
+inline float seed_hole_point[2] = {};
+inline float seed_hole_dir[3] = {0.0f, 0.0f, 1.0f};
+inline float seed_hole_anchor[3] = {0.0f, 0.0f, 1.0f};
 inline uintptr_t seed_entity = 0;
 inline int seed_class = 0;
 inline float seed_proportion[2] = {};
@@ -166,9 +227,10 @@ inline int PadSector(float x, float y) {
     return y * two_thirds <= x ? 4 : 5;
 }
 
-// The class's rest head height at (x, y): the sector's three shape heights
-// blended with the barycentric weights of 0x4E86E4.
-inline float RestHeight(int class_id, float x, float y, int sector) {
+// A per-shape measure at (x, y): of seven values in shape slot order, the
+// sector's three blended with the barycentric weights of 0x4E86E4, as the
+// game blends the shapes' vertices.
+inline float BlendShapes(const float* seven, float x, float y, int sector) {
     const int* corner = PAD_SECTORS[sector];
     const float* p0 = PAD_CORNERS[corner[0]];
     const float* p1 = PAD_CORNERS[corner[1]];
@@ -176,9 +238,134 @@ inline float RestHeight(int class_id, float x, float y, int sector) {
     const float c = (x - p0[0]) / (p2[0] - p0[0]);
     const float b = ((y - p0[1]) - c * (p2[1] - p0[1])) / (p1[1] - p0[1]);
     const float a = 1.0f - (b + c);
-    const float* h = PROPORTION_SHAPE_HEIGHTS[class_id];
-    return a * h[CornerShape(corner[0])] + b * h[CornerShape(corner[1])] +
-           c * h[CornerShape(corner[2])];
+    return a * seven[CornerShape(corner[0])] + b * seven[CornerShape(corner[1])] +
+           c * seven[CornerShape(corner[2])];
+}
+
+// The class's rest head height at (x, y).
+inline float RestHeight(int class_id, float x, float y, int sector) {
+    return BlendShapes(PROPORTION_SHAPE_HEIGHTS[class_id], x, y, sector);
+}
+
+// Whether a pad sector blends the FOmar's glove scale: some corner shape of
+// the sector is the shape that carries it. Where none does, the class file's
+// scale stays and the hand is built differently (the kept rows).
+inline bool UsesKeptRows(int class_id, int sector) {
+    if (class_id != FOMAR_CLASS)
+        return false;
+    for (int i = 0; i < 3; i++)
+        if (CornerShape(PAD_SECTORS[sector][i]) == FOMAR_SCALED_SHAPE)
+            return false;
+    return true;
+}
+
+// A class's channel row set for a pad sector: point rows [7][2] and
+// direction rows [7][3].
+struct ChannelRows {
+    const float (*point)[2];
+    const float (*dir)[3];
+};
+inline ChannelRows ChannelRowsFor(int class_id, int sector) {
+    if (UsesKeptRows(class_id, sector))
+        return {PROPORTION_SHAPE_HOLE_POINT_FOMAR_KEPT, PROPORTION_SHAPE_HOLE_DIR_FOMAR_KEPT};
+    return {PROPORTION_SHAPE_HOLE_POINT[class_id], PROPORTION_SHAPE_HOLE_DIR[class_id]};
+}
+
+inline void Normalize3(float* v) {
+    const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len > 0.0f)
+        for (int i = 0; i < 3; i++)
+            v[i] /= len;
+}
+
+// A class's fist channel at pad position (x, y): the rows' points and
+// directions blended with the shape weights (the direction renormalized),
+// and the anchor, the same rows' direction at the default-proportions body.
+inline void BlendChannel(int class_id, float x, float y, int sector, float point[2],
+                         float dir[3], float anchor[3]) {
+    const ChannelRows rows = ChannelRowsFor(class_id, sector);
+    const int* corner = PAD_SECTORS[sector];
+    const float* p0 = PAD_CORNERS[corner[0]];
+    const float* p1 = PAD_CORNERS[corner[1]];
+    const float* p2 = PAD_CORNERS[corner[2]];
+    const float c = (x - p0[0]) / (p2[0] - p0[0]);
+    const float b = ((y - p0[1]) - c * (p2[1] - p0[1])) / (p1[1] - p0[1]);
+    const float weight[3] = {1.0f - (b + c), b, c};
+    for (int i = 0; i < 2; i++)
+        point[i] = 0.0f;
+    for (int i = 0; i < 3; i++)
+        dir[i] = 0.0f;
+    for (int n = 0; n < 3; n++) {
+        const int shape = CornerShape(corner[n]);
+        for (int i = 0; i < 2; i++)
+            point[i] += weight[n] * rows.point[shape][i];
+        for (int i = 0; i < 3; i++)
+            dir[i] += weight[n] * rows.dir[shape][i];
+    }
+    Normalize3(dir);
+    for (int i = 0; i < 3; i++)
+        anchor[i] = rows.dir[HOLE_ANCHOR_SHAPE][i];
+    Normalize3(anchor);
+}
+
+// The shapes and weights the seeded character's hand blends (the same three
+// corner shapes and barycentric weights as BlendChannel), and whether its
+// class takes the kept rows there. False with no seed, or when the seed is
+// for another class.
+inline bool SeedPadWeights(int class_id, int shape[3], float w[3], bool& kept) {
+    if (!seed_valid || seed_class != class_id)
+        return false;
+    const float x = seed_proportion[0], y = seed_proportion[1];
+    const int sector = PadSector(x, y);
+    const int* corner = PAD_SECTORS[sector];
+    const float* p0 = PAD_CORNERS[corner[0]];
+    const float* p1 = PAD_CORNERS[corner[1]];
+    const float* p2 = PAD_CORNERS[corner[2]];
+    const float c = (x - p0[0]) / (p2[0] - p0[0]);
+    const float b = ((y - p0[1]) - c * (p2[1] - p0[1])) / (p1[1] - p0[1]);
+    w[0] = 1.0f - (b + c);
+    w[1] = b;
+    w[2] = c;
+    for (int n = 0; n < 3; n++)
+        shape[n] = CornerShape(corner[n]);
+    kept = UsesKeptRows(class_id, sector);
+    return true;
+}
+
+// A channel direction as two turns of the handle's +z, in radians: about x
+// by tilt (positive toward -y, the fingers), then about y by yaw (positive
+// toward +x, out of the palm).
+inline void ChannelTurns(const float d[3], float& tilt, float& yaw) {
+    tilt = atan2f(-d[1], sqrtf(d[0] * d[0] + d[2] * d[2]));
+    yaw = atan2f(d[0], d[2]);
+}
+
+// A fist channel ready for the seat: the point, the blend's turns, the
+// anchor's turns and the turns the seat uses. The seat's turns move
+// `follow` of the way from the anchor's (the default build's hand) to the
+// blend's: 1 = the blend itself, 0 = the default build's angle on every
+// build. The point stays the blend's.
+struct ChannelSeat {
+    float point[2];
+    float blend_tilt, blend_yaw;
+    float anchor_tilt, anchor_yaw;
+    float tilt, yaw;
+};
+inline ChannelSeat ResolveChannel(const float point[2], const float dir[3],
+                                  const float anchor[3], float follow) {
+    ChannelSeat s;
+    s.point[0] = point[0];
+    s.point[1] = point[1];
+    ChannelTurns(dir, s.blend_tilt, s.blend_yaw);
+    ChannelTurns(anchor, s.anchor_tilt, s.anchor_yaw);
+    if (follow == 1.0f) {
+        s.tilt = s.blend_tilt;
+        s.yaw = s.blend_yaw;
+    } else {
+        s.tilt = s.anchor_tilt + follow * (s.blend_tilt - s.anchor_tilt);
+        s.yaw = s.anchor_yaw + follow * (s.blend_yaw - s.anchor_yaw);
+    }
+    return s;
 }
 
 inline bool OnPad(float v) {
@@ -218,16 +405,56 @@ inline bool SeedFromProportions(uintptr_t entity) {
     const int sector = PadSector(pair[0], pair[1]);
     const float rest = RestHeight(class_id, pair[0], pair[1], sector);
     seed_units = rest * IDLE_HEAD_FACTOR + height_offset;
+    BlendChannel(class_id, pair[0], pair[1], sector, seed_hole_point, seed_hole_dir,
+                 seed_hole_anchor);
     seed_entity = entity;
     seed_class = class_id;
     memcpy(seed_proportion, pair, sizeof(seed_proportion));
     seed_valid = true;
     seed_fail_entity = 0;
     diag::Log("eyeheight: seeded from the proportions: class %d pair %.3f / %.3f -> sector %d, "
-              "rest %.2f x %.3f + %.2f = %.2f units (%.3f m at scale %.2f)",
+              "rest %.2f x %.3f + %.2f = %.2f units (%.3f m at scale %.2f); "
+              "fist channel point %.4f / %.4f units, direction %.4f / %.4f / %.4f",
               class_id, pair[0], pair[1], sector, rest, IDLE_HEAD_FACTOR, height_offset,
-              seed_units, seed_units / vrmod::config.world_scale, vrmod::config.world_scale);
+              seed_units, seed_units / vrmod::config.world_scale, vrmod::config.world_scale,
+              seed_hole_point[0], seed_hole_point[1], seed_hole_dir[0], seed_hole_dir[1],
+              seed_hole_dir[2]);
+    const ChannelSeat seat = ResolveChannel(seed_hole_point, seed_hole_dir, seed_hole_anchor,
+                                            vrmod::config.melee_angle_follow);
+    const float r2d = 180.0f / 3.14159265f;
+    diag::Log("eyeheight: fist channel for class %d pad %.3f / %.3f: point %.4f / %.4f, blend "
+              "tilt %.2f yaw %.2f deg, default build tilt %.2f yaw %.2f, followed (%.2f) tilt "
+              "%.2f yaw %.2f",
+              class_id, pair[0], pair[1], seat.point[0], seat.point[1], seat.blend_tilt * r2d,
+              seat.blend_yaw * r2d, seat.anchor_tilt * r2d, seat.anchor_yaw * r2d,
+              vrmod::config.melee_angle_follow, seat.tilt * r2d, seat.yaw * r2d);
     return true;
+}
+
+// The seeded character's fist channel in the grip point's rest frame: the
+// point (x, y at z = 0, game units), the unit direction and the anchor
+// direction (the class's default-proportions body), blended for its build.
+// False with no proportion seed (the sampled height says nothing about the
+// hand).
+inline bool HandChannel(float point[2], float dir[3], float anchor[3]) {
+    if (!seed_valid)
+        return false;
+    memcpy(point, seed_hole_point, sizeof(seed_hole_point));
+    memcpy(dir, seed_hole_dir, sizeof(seed_hole_dir));
+    memcpy(anchor, seed_hole_anchor, sizeof(seed_hole_anchor));
+    return true;
+}
+
+// The reference hand's channel, the stand-in without a proportion seed: the
+// reference body's own row, which is also its anchor.
+inline void HandChannelReference(float point[2], float dir[3], float anchor[3]) {
+    for (int i = 0; i < 2; i++)
+        point[i] = PROPORTION_SHAPE_HOLE_POINT[REFERENCE_HAND_CLASS][REFERENCE_HAND_SHAPE][i];
+    for (int i = 0; i < 3; i++)
+        dir[i] = PROPORTION_SHAPE_HOLE_DIR[REFERENCE_HAND_CLASS][REFERENCE_HAND_SHAPE][i];
+    Normalize3(dir);
+    for (int i = 0; i < 3; i++)
+        anchor[i] = dir[i];
 }
 
 // Called every gamecam::Apply. Recomputes when there is no seed or the

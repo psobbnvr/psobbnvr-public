@@ -119,6 +119,10 @@ inline unsigned trail_kept_total = 0;
 inline unsigned trail_dropped_total = 0;
 inline int trail_kept_last_pass = 0;
 inline int trail_dropped_last_pass = 0;
+// The last trail sample's blade speed (m/s): in room space (the hand's own
+// motion) and through the world (weapongrip TrailFast).
+inline float trail_speed_hand = 0.0f;
+inline float trail_speed_world = 0.0f;
 inline int menutrace_frames = 0;
 inline bool menutrace_full = false;
 // The controller's menu mode this frame (a menu, prompt or non-gameplay

@@ -9,6 +9,9 @@
 //      with [registry] redirect=0). Read by the game at launch.
 //   3. VR settings - selected psobbvr.ini keys, read by the mod at
 //      launch.
+//   4. Spell wheel - psobbvr.ini [wheel]: each class's pages
+//      (psobbvr_wheel_core.hpp) and the wheel's main switches. A running
+//      game reloads them within a second of Save.
 //
 // Shows each setting as the mod reads it: psobbvr.ini over
 // psobbvr-defaults.ini (psobbvr_settings.hpp). Save writes psobbvr.ini
@@ -21,12 +24,16 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "psobbvr_bindings_core.hpp"
 #include "psobbvr_settings.hpp"
+#include "psobbvr_wheel_core.hpp"
 #include "common/registry_seed.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -52,7 +59,7 @@ HFONT g_font = nullptr;
 HFONT g_font_bold = nullptr;
 HFONT g_font_mono = nullptr;
 
-enum Page { PAGE_BINDINGS = 0, PAGE_GAME = 1, PAGE_VR = 2, PAGE_COUNT = 3 };
+enum Page { PAGE_BINDINGS = 0, PAGE_GAME = 1, PAGE_VR = 2, PAGE_WHEEL = 3, PAGE_COUNT = 4 };
 HWND g_page[PAGE_COUNT] = {};
 int g_page_index = PAGE_BINDINGS;
 // Page scrolling, in screen pixels: each page's content height, the
@@ -67,14 +74,18 @@ int g_dpi = 96;
 int S(int v) { return MulDiv(v, g_dpi, 96); }
 
 // Control ids. Bindings combos 1000.., common buttons 2000.., game page
-// 3000.., VR page 4000.. (one id per knob; the resolution pair shares one).
+// 3000.., VR page 4000.. (one id per knob; the resolution pair shares one),
+// spell wheel page 5000.. (segments 5100.., switches 5200..).
 enum {
     ID_FIRST_COMBO = 1000,
     ID_CHECK = 2001, ID_SAVE = 2002, ID_DEFAULTS = 2003, ID_RELOAD = 2004, ID_OPENINI = 2005,
     ID_EXPORT = 2007, ID_IMPORT = 2008,
     ID_G_PRESET = 3000, ID_G_SHADOW, ID_G_ENEMY, ID_G_MAP, ID_G_CLIP, ID_G_FOG, ID_G_ADVANCED,
     ID_G_LOWRES, ID_G_FRAMESKIP, ID_G_AUTOFS, ID_G_BGM, ID_G_SE, ID_G_SAVEACCOUNT,
-    ID_VR_FIRST = 4000
+    ID_VR_FIRST = 4000,
+    ID_W_CHAR = 5000, ID_W_FILL, ID_W_PREV, ID_W_NEXT, ID_W_ADD, ID_W_REMOVE, ID_W_CLEAR,
+    ID_W_SEG_FIRST = 5100,
+    ID_W_KNOB_FIRST = 5200
 };
 
 constexpr int MARGIN = 12;
@@ -92,8 +103,9 @@ void ClearLog() { SetWindowTextA(g_log, ""); }
 void LogCb(void*, const char* line) { AppendLog(line); }
 void SetStatus(const char* s) { SetWindowTextA(g_status, s); }
 
-HWND MakeLabel(HWND parent, const char* text, int x, int y, int w, int h, HFONT font) {
-    HWND h_ = CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, S(x), S(y), S(w),
+HWND MakeLabel(HWND parent, const char* text, int x, int y, int w, int h, HFONT font,
+               DWORD align = SS_LEFT) {
+    HWND h_ = CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE | align, S(x), S(y), S(w),
                               S(h), parent, nullptr, nullptr, nullptr);
     SendMessageA(h_, WM_SETFONT, (WPARAM)font, TRUE);
     return h_;
@@ -115,7 +127,7 @@ HWND MakeCheck(HWND parent, const char* text, int id, int x, int y, int w) {
 
 HWND MakeDropList(HWND parent, int id, int x, int y, int w, const char* const* items, int n) {
     HWND c = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
-                             CBS_DROPDOWNLIST, S(x), S(y), S(w), S(300), parent,
+                             CBS_DROPDOWNLIST, S(x), S(y), S(w), S(400), parent,
                              (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(c, WM_SETFONT, (WPARAM)g_font, TRUE);
     for (int i = 0; i < n; i++) SendMessageA(c, CB_ADDSTRING, 0, (LPARAM)items[i]);
@@ -845,7 +857,7 @@ constexpr Knob kKnobs[] = {
     // --- Hands and combat
     {"vr", "hand_presence", "Show hands", K_BOOL, 0, 1, "1", nullptr,
      "Draws your character's hands on the controllers."},
-    {"vr", "ik_arms", "IK arms (experimental)", K_BOOL, 0, 1, "0", nullptr,
+    {"vr", "ik_arms", "IK arms (experimental)", K_BOOL, 0, 1, "1", nullptr,
      "Draws your character's whole arms, reaching for your controllers with the elbows bent to fit, "
      "in place of the hands alone. Still being tuned."},
     {"vr", "weapon_scale", "Hand and weapon size", K_FLOAT, 0.1, 2, "0.7", nullptr,
@@ -853,7 +865,8 @@ constexpr Knob kKnobs[] = {
     {"vr", "hand_pitch_deg", "Hand angle (degrees)", K_FLOAT, -45, 45, "-10", nullptr,
      "Tilts the hands on the controllers. Negative points the fingers down."},
     {"vr", "weapon_trail", "Weapon photon trail", K_BOOL, 0, 1, "1", nullptr,
-     "Melee weapons leave their photon trail behind a fast swing of your hand."},
+     "Melee weapons leave their photon trail when the blade moves fast: a swing of your hand, "
+     "or your character running."},
     {"vr", "swing_attack", "Swing to attack", K_BOOL, 0, 2, "2", nullptr,
      "On: swing to attack. For heavy and special attacks, press their button, then swing. "
      "Off: attacks fire on the button press."},
@@ -991,10 +1004,10 @@ bool WriteUserValue(const char* section, const char* key, const char* value) {
     return WritePrivateProfileStringA(section, key, value, g_ini_path) != 0;
 }
 
-void KnobShow(int i, const char* value) {
-    const Knob& k = kKnobs[i];
+// Show `value` in the knob's control `ctl`.
+void KnobShow(const Knob& k, HWND ctl, const char* value) {
     switch (k.type) {
-    case K_BOOL: SetChecked(g_knob[i], atoi(value) != 0); break;
+    case K_BOOL: SetChecked(ctl, atoi(value) != 0); break;
     case K_CHOICE:
     case K_RESOLUTION: {
         int idx = ChoiceIndexOf(k, value);
@@ -1002,25 +1015,25 @@ void KnobShow(int i, const char* value) {
             // Unknown value (hand-edited ini): add it so nothing is lost.
             char text[64];
             snprintf(text, sizeof(text), "%s (custom)", value);
-            idx = (int)SendMessageA(g_knob[i], CB_ADDSTRING, 0, (LPARAM)text);
+            idx = (int)SendMessageA(ctl, CB_ADDSTRING, 0, (LPARAM)text);
         }
-        SetSel(g_knob[i], idx);
+        SetSel(ctl, idx);
         break;
     }
-    default: SetWindowTextA(g_knob[i], value); break;
+    default: SetWindowTextA(ctl, value); break;
     }
 }
 
-// Value the control holds, as ini text. False = out of range / not a number.
-bool KnobCollect(int i, char* out, size_t cap, char* err, size_t ecap) {
-    const Knob& k = kKnobs[i];
+// Value the knob's control `ctl` holds, as ini text. False = out of range /
+// not a number.
+bool KnobCollect(const Knob& k, HWND ctl, char* out, size_t cap, char* err, size_t ecap) {
     err[0] = 0;
     switch (k.type) {
     // Checked writes the knob's max (1 for plain on/off; swing_attack's "on" is mode 2).
-    case K_BOOL: snprintf(out, cap, "%d", Checked(g_knob[i]) ? (int)k.max : 0); return true;
+    case K_BOOL: snprintf(out, cap, "%d", Checked(ctl) ? (int)k.max : 0); return true;
     case K_CHOICE:
     case K_RESOLUTION: {
-        const int idx = Sel(g_knob[i]);
+        const int idx = Sel(ctl);
         if (idx < 0) { snprintf(err, ecap, "%s: nothing selected", k.label); return false; }
         if (idx < ChoiceCount(k)) {
             char l[64];
@@ -1028,7 +1041,7 @@ bool KnobCollect(int i, char* out, size_t cap, char* err, size_t ecap) {
         } else {
             // the "(custom)" entry: take the text before the space
             char text[64];
-            SendMessageA(g_knob[i], CB_GETLBTEXT, idx, (LPARAM)text);
+            SendMessageA(ctl, CB_GETLBTEXT, idx, (LPARAM)text);
             char* sp = strchr(text, ' ');
             if (sp) *sp = 0;
             snprintf(out, cap, "%s", text);
@@ -1037,7 +1050,7 @@ bool KnobCollect(int i, char* out, size_t cap, char* err, size_t ecap) {
     }
     default: {
         char text[64];
-        GetWindowTextA(g_knob[i], text, sizeof(text));
+        GetWindowTextA(ctl, text, sizeof(text));
         char* endp = nullptr;
         const double v = strtod(text, &endp);
         if (endp == text || *endp != 0) {
@@ -1059,7 +1072,8 @@ bool KnobCollect(int i, char* out, size_t cap, char* err, size_t ecap) {
 // turning: grey out whichever the Turning choice shown leaves unused.
 void VrSyncTurning() {
     char v[64], err[200];
-    const bool snap = KnobCollect(KnobIndex("snap_turn_deg"), v, sizeof(v), err, sizeof(err)) &&
+    const int turning = KnobIndex("snap_turn_deg");
+    const bool snap = KnobCollect(kKnobs[turning], g_knob[turning], v, sizeof(v), err, sizeof(err)) &&
                       atof(v) > 0.0;
     EnableWindow(g_knob[KnobIndex("stick_turn_deg_s")], !snap);
     EnableWindow(g_knob[KnobIndex("snap_turn_repeat")], snap);
@@ -1071,7 +1085,7 @@ void VrLoad(bool announce) {
     for (int i = 0; i < kKnobCount; i++) {
         char v[64];
         ReadIniValue(kKnobs[i], v, sizeof(v));
-        KnobShow(i, v);
+        KnobShow(kKnobs[i], g_knob[i], v);
     }
     VrSyncTurning();
     char status[400];
@@ -1087,7 +1101,7 @@ void VrSave() {
     bool ok = true;
     for (int i = 0; i < kKnobCount; i++) {
         char err[200];
-        if (!KnobCollect(i, values[i], sizeof(values[i]), err, sizeof(err))) {
+        if (!KnobCollect(kKnobs[i], g_knob[i], values[i], sizeof(values[i]), err, sizeof(err))) {
             AppendLog(err);
             ok = false;
         }
@@ -1155,7 +1169,7 @@ void VrDefaults() {
     for (int i = 0; i < kKnobCount; i++) {
         char def[64];
         KnobDefault(kKnobs[i], def, sizeof(def));
-        KnobShow(i, def);
+        KnobShow(kKnobs[i], g_knob[i], def);
     }
     VrSyncTurning();
     ClearLog();
@@ -1243,6 +1257,45 @@ void AddInfoIcon(HWND page, HWND ctl, bool checkbox, const char* text, const cha
     SendMessageA(g_vr_tips, TTM_ADDTOOLA, 0, (LPARAM)&ti);
 }
 
+// One knob's row at (x0, yy) in a column col_w wide: a checkbox, or a
+// label with a drop-down list or a number box and its range. Returns the
+// control; *label_ctl gets the label (nullptr for a checkbox).
+constexpr int KNOB_LBL = 180, KNOB_CTL = 110, KNOB_ROW = 27;
+
+HWND MakeKnob(HWND page, const Knob& k, int id, int x0, int yy, int col_w, HWND* label_ctl) {
+    *label_ctl = nullptr;
+    switch (k.type) {
+    case K_BOOL: {
+        // A checkbox reports the focus only with BS_NOTIFY; the status
+        // line's explanation of the knob needs it.
+        const HWND ctl = MakeCheck(page, k.label, id, x0, yy + 1, KNOB_LBL + KNOB_CTL);
+        SetWindowLongA(ctl, GWL_STYLE, GetWindowLongA(ctl, GWL_STYLE) | BS_NOTIFY);
+        return ctl;
+    }
+    case K_CHOICE:
+    case K_RESOLUTION: {
+        *label_ctl = MakeLabel(page, k.label, x0, yy + 4, KNOB_LBL, 18, g_font);
+        const int n = ChoiceCount(k);
+        const HWND ctl = MakeDropList(page, id, x0 + KNOB_LBL, yy, col_w - KNOB_LBL - 16, nullptr, 0);
+        for (int c = 0; c < n; c++) {
+            char l[64], v[64];
+            ChoiceAt(k, c, l, sizeof(l), v, sizeof(v));
+            SendMessageA(ctl, CB_ADDSTRING, 0, (LPARAM)l);
+        }
+        return ctl;
+    }
+    default: {
+        *label_ctl = MakeLabel(page, k.label, x0, yy + 4, KNOB_LBL, 18, g_font);
+        const HWND ctl = MakeEdit(page, id, x0 + KNOB_LBL, yy, KNOB_CTL - 30);
+        char rng[64];
+        snprintf(rng, sizeof(rng), "%g..%g  (default %s)", k.min, k.max, k.def);
+        MakeLabel(page, rng, x0 + KNOB_LBL + KNOB_CTL - 24, yy + 4, col_w - KNOB_LBL - KNOB_CTL + 20,
+                  18, g_font);
+        return ctl;
+    }
+    }
+}
+
 int BuildVrPage(HWND page) {
     int y = MARGIN;
     MakeLabel(page, "The mod's settings, saved in psobbvr.ini. Click a setting to see what it does in the "
@@ -1253,7 +1306,6 @@ int BuildVrPage(HWND page) {
     // Two columns: comfort and movement on the left, hands and combat on
     // the right.
     const int COL_W = (PAGE_W - 2 * MARGIN) / 2;
-    const int LBL = 180, CTL = 110, ROW = 27;
     int col_y[2] = {y, y};
     for (int i = 0; i < kKnobCount; i++) {
         const int col = i < kGroupStarts[2] ? 0 : 1;
@@ -1265,44 +1317,810 @@ int BuildVrPage(HWND page) {
             }
         }
         const Knob& k = kKnobs[i];
-        const int yy = col_y[col];
-        const int id = ID_VR_FIRST + i;
-        const char* label = k.label;
         HWND label_ctl = nullptr;
-        switch (k.type) {
-        case K_BOOL:
-            g_knob[i] = MakeCheck(page, label, id, x0, yy + 1, LBL + CTL);
-            break;
-        case K_CHOICE:
-        case K_RESOLUTION: {
-            label_ctl = MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
-            const int n = ChoiceCount(k);
-            g_knob[i] = MakeDropList(page, id, x0 + LBL, yy, COL_W - LBL - 16, nullptr, 0);
-            for (int c = 0; c < n; c++) {
-                char l[64], v[64];
-                ChoiceAt(k, c, l, sizeof(l), v, sizeof(v));
-                SendMessageA(g_knob[i], CB_ADDSTRING, 0, (LPARAM)l);
-            }
-            break;
-        }
-        default: {
-            label_ctl = MakeLabel(page, label, x0, yy + 4, LBL, 18, g_font);
-            g_knob[i] = MakeEdit(page, id, x0 + LBL, yy, CTL - 30);
-            char rng[64];
-            snprintf(rng, sizeof(rng), "%g..%g  (default %s)", k.min, k.max, k.def);
-            MakeLabel(page, rng, x0 + LBL + CTL - 24, yy + 4, COL_W - LBL - CTL + 20, 18, g_font);
-            break;
-        }
-        }
+        g_knob[i] = MakeKnob(page, k, ID_VR_FIRST + i, x0, col_y[col], COL_W, &label_ctl);
         if (k.tip != nullptr) {
             if (k.type == K_BOOL)
-                AddInfoIcon(page, g_knob[i], true, label, k.tip);
+                AddInfoIcon(page, g_knob[i], true, k.label, k.tip);
             else
-                AddInfoIcon(page, label_ctl, false, label, k.tip);
+                AddInfoIcon(page, label_ctl, false, k.label, k.tip);
         }
-        col_y[col] += ROW;
+        col_y[col] += KNOB_ROW;
     }
     y = col_y[0] > col_y[1] ? col_y[0] : col_y[1];
+    return y + MARGIN;
+}
+
+// ------------------------------------------------------ page 4: spell wheel
+
+namespace wc = wheelcore;
+
+// The [wheel] switches shown here; the section's other settings stay
+// ini-only.
+constexpr Knob kWheelKnobs[] = {
+    {"wheel", "enabled", "Spell wheel on", K_BOOL, 0, 1, "1", nullptr,
+     "Hold X (the \"wheel\" action in Controller bindings) to open a ring of techniques, or traps for "
+     "androids, at your right hand. A swing with no other button held casts what you chose."},
+    {"wheel", "swing_hand", "Cast from", K_CHOICE, 0, 0, "both",
+     "Both hands=both|Left hand=left|Right hand=right",
+     "Which hand's swing casts the wheel's choice. The left hand never casts an aimed technique "
+     "(Foie, Barta, Megid...), so those need Both hands or Right hand."},
+    {"wheel", "hand_icon", "Icon on the left hand", K_BOOL, 0, 1, "1", nullptr,
+     "Shows the chosen technique's or trap's icon on the palm of your left hand."},
+    {"wheel", "haptics", "Vibration", K_BOOL, 0, 1, "1", nullptr,
+     "A light tick as the highlight moves to another segment, and a firmer pulse when you choose."},
+    {"wheel", "size_m", "Wheel size (m)", K_FLOAT, 0.1, 1, "0.35", nullptr,
+     "How wide the ring is, in meters."},
+};
+constexpr int kWheelKnobCount = sizeof(kWheelKnobs) / sizeof(kWheelKnobs[0]);
+HWND g_w_knob[kWheelKnobCount] = {};
+
+// What each class can learn: the game executable's maximum-level table
+// when it can be read (a server's build may differ from the copy built
+// in), else wheelcore::kMaxLevels.
+unsigned char g_w_levels[wc::kClassCount][wc::kTechCount] = {};
+bool g_w_levels_tried = false;
+char g_w_levels_note[200] = "";
+
+// One character's wheel as edited, with what the game's characters file
+// says of the character.
+struct WheelChar {
+    wc::CharLayout c;
+    int level = 0;  // as shown in the game; 0 unknown
+    int shown = 0;  // the page shown
+};
+std::vector<WheelChar> g_w_chars;        // by guild card, then slot
+int g_w_char = 0;                        // the character shown
+FILETIME g_w_roster_time = {};           // the characters file as last read
+HWND g_w_intro, g_w_char_list, g_w_fill, g_w_counter, g_w_prev, g_w_next, g_w_add, g_w_remove,
+    g_w_clear;
+const char* const kWheelIntro =
+    "Each character has its own wheel: up to eight pages of eight segments, laid out here as they "
+    "sit on the ring. Pick the character, fill the segments of each page, then Save. A running game "
+    "reloads it within a second. A new character is listed once it has entered the world.";
+const char* const kWheelIntroEmpty =
+    "No characters yet. Start the game with the mod and enter the world with a character once: "
+    "your characters are then listed here, each with its own wheel.";
+HWND g_w_seg[wc::kSegments] = {};
+// Where each compass segment sits in the 3 x 3 grid, and its place in words.
+constexpr int kSegCol[wc::kSegments] = {1, 2, 2, 2, 1, 0, 0, 0};
+constexpr int kSegRow[wc::kSegments] = {0, 0, 1, 2, 2, 2, 1, 0};
+const char* const kSegWhere[wc::kSegments] = {"top", "top right", "right", "bottom right",
+                                              "bottom", "bottom left", "left", "top left"};
+
+// The maximum-level table's pointer array in the executable (see
+// wheelcore::kMaxLevels).
+constexpr DWORD kMaxLevelTableVa = 0x9CC520;
+
+// `n` bytes at virtual address `va` of a 32-bit PE file, found through its
+// section table. False when the address has no data in the file.
+bool ReadPeBytes(FILE* f, DWORD image_base, const IMAGE_SECTION_HEADER* sec, int nsec, DWORD va,
+                 void* out, DWORD n) {
+    if (va < image_base)
+        return false;
+    const DWORD rva = va - image_base;
+    for (int i = 0; i < nsec; i++) {
+        DWORD size = sec[i].SizeOfRawData;
+        if (sec[i].Misc.VirtualSize != 0 && sec[i].Misc.VirtualSize < size)
+            size = sec[i].Misc.VirtualSize;
+        if (rva < sec[i].VirtualAddress || rva - sec[i].VirtualAddress > size ||
+            n > size - (rva - sec[i].VirtualAddress))
+            continue;
+        return fseek(f, (long)(sec[i].PointerToRawData + (rva - sec[i].VirtualAddress)), SEEK_SET) ==
+                   0 &&
+               fread(out, 1, n, f) == n;
+    }
+    return false;
+}
+
+// The maximum-level table from the executable at `path`: the twelve row
+// pointers, then each row, every byte kCannotLearn or at most 0x1D (level
+// 30, the game's highest). False, with the reason, on anything else.
+bool ReadClassTable(const char* path, unsigned char out[wc::kClassCount][wc::kTechCount],
+                    const char** why) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) {
+        *why = "no Psobb.exe beside psobbvr.ini";
+        return false;
+    }
+    *why = "Psobb.exe does not hold the table where expected";
+    IMAGE_DOS_HEADER dos = {};
+    IMAGE_NT_HEADERS32 nt = {};
+    IMAGE_SECTION_HEADER sec[96];
+    int nsec = 0;
+    bool ok = fread(&dos, sizeof(dos), 1, f) == 1 && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+              fseek(f, dos.e_lfanew, SEEK_SET) == 0 && fread(&nt, sizeof(nt), 1, f) == 1 &&
+              nt.Signature == IMAGE_NT_SIGNATURE &&
+              nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    if (ok) {
+        nsec = nt.FileHeader.NumberOfSections;
+        ok = nsec > 0 && nsec <= 96 &&
+             fseek(f, dos.e_lfanew + (long)offsetof(IMAGE_NT_HEADERS32, OptionalHeader) +
+                          nt.FileHeader.SizeOfOptionalHeader, SEEK_SET) == 0 &&
+             fread(sec, sizeof(sec[0]), (size_t)nsec, f) == (size_t)nsec;
+    }
+    const DWORD base = nt.OptionalHeader.ImageBase;
+    DWORD rows[wc::kClassCount] = {};
+    unsigned char t[wc::kClassCount][wc::kTechCount] = {};
+    ok = ok && ReadPeBytes(f, base, sec, nsec, kMaxLevelTableVa, rows, sizeof(rows));
+    for (int c = 0; ok && c < wc::kClassCount; c++)
+        ok = ReadPeBytes(f, base, sec, nsec, rows[c], t[c], wc::kTechCount);
+    fclose(f);
+    for (int c = 0; ok && c < wc::kClassCount; c++)
+        for (int i = 0; ok && i < wc::kTechCount; i++)
+            ok = t[c][i] == wc::kCannotLearn || t[c][i] <= 0x1D;
+    if (ok)
+        memcpy(out, t, sizeof(t));
+    return ok;
+}
+
+// Fill g_w_levels once, and say where it came from.
+void WheelReadClassTable() {
+    if (g_w_levels_tried)
+        return;
+    g_w_levels_tried = true;
+    memcpy(g_w_levels, wc::kMaxLevels, sizeof(g_w_levels));
+    char folder[MAX_PATH], exe[MAX_PATH + 16];
+    IniFolder(folder, sizeof(folder));
+    snprintf(exe, sizeof(exe), "%s%sPsobb.exe", folder, folder[0] ? "\\" : "");
+    const char* why = "";
+    if (ReadClassTable(exe, g_w_levels, &why))
+        snprintf(g_w_levels_note, sizeof(g_w_levels_note),
+                 "Spell wheel class table: read from Psobb.exe%s.",
+                 memcmp(g_w_levels, wc::kMaxLevels, sizeof(g_w_levels)) == 0
+                     ? " (the same as the built-in copy)"
+                     : " - it differs from the built-in copy, so the lists follow this game's classes");
+    else
+        snprintf(g_w_levels_note, sizeof(g_w_levels_note), "Spell wheel class table: built in (%s).",
+                 why);
+}
+
+bool WheelKnownClass(int cls) { return cls >= 0 && cls < wc::kClassCount; }
+
+// The class's row for the lists and the fill. Androids learn no
+// techniques whatever the table says: their wheel holds traps.
+const unsigned char* WheelLevels(int cls) {
+    static unsigned char none[wc::kTechCount];
+    if (WheelKnownClass(cls) && !wc::IsAndroid(cls))
+        return g_w_levels[cls];
+    memset(none, wc::kCannotLearn, sizeof(none));
+    return none;
+}
+
+// A character whose class is not known (a hand-written block for one the
+// game has not listed) can hold anything.
+bool WheelCanUse(int cls, wc::Entry e) {
+    return !WheelKnownClass(cls) || wc::CanUse(cls, e, WheelLevels(cls));
+}
+
+WheelChar* WheelCur() {
+    return g_w_char >= 0 && g_w_char < (int)g_w_chars.size() ? &g_w_chars[g_w_char] : nullptr;
+}
+int WheelCurClass() {
+    const WheelChar* w = WheelCur();
+    return w != nullptr ? w->c.cls : -1;
+}
+
+// A segment list item's data: the entry it stands for.
+LPARAM EntryData(wc::Entry e) { return ((LPARAM)e.kind << 8) | (LPARAM)e.index; }
+wc::Entry DataEntry(LRESULT d) {
+    wc::Entry e;
+    e.kind = (wc::Kind)((d >> 8) & 0xFF);
+    e.index = (int)(d & 0xFF);
+    return wc::Clamped(e);
+}
+
+// A segment list's text for an entry the class shown cannot use, such as
+// "Grants (cannot learn)"; the class is named in the list above.
+void UnusableText(wc::Entry e, char* out, size_t cap) {
+    snprintf(out, cap, "%s (cannot %s)", wc::NameOf(e),
+             e.kind == wc::Kind::Technique ? "learn" : "use");
+}
+
+std::wstring Widen(const std::string& utf8) {
+    wchar_t w[256];
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), w, 256);
+    return std::wstring(w, n > 0 ? (size_t)n : 0);
+}
+
+// The character list is a Unicode control, so a name shows in any script.
+HWND MakeDropListW(HWND parent, int id, int x, int y, int w) {
+    HWND c = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                             CBS_DROPDOWNLIST, S(x), S(y), S(w), S(400), parent,
+                             (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+    return c;
+}
+
+// The character list's text for a character: its name, class and level,
+// the account's guild card number, and how many pages it has. A character
+// the game has not listed (a hand-written block) has no name to show and is
+// told apart by its slot.
+std::wstring WheelCharText(int i) {
+    const WheelChar& w = g_w_chars[i];
+    const char* cls = WheelKnownClass(w.c.cls) ? wc::kClasses[w.c.cls].name : "class not known";
+    wchar_t who[160], level[24] = L"", card[40], pages[32];
+    if (w.level > 0)
+        swprintf_s(level, L", Lv %d", w.level);
+    if (w.c.name.empty())
+        swprintf_s(who, L"(no name, slot %d) (%hs%ls)", w.c.slot + 1, cls, level);
+    else
+        swprintf_s(who, L"%ls (%hs%ls)", Widen(w.c.name).c_str(), cls, level);
+    swprintf_s(card, L" - GC %u", w.c.guild_card);
+    const int n = w.c.layout.pages;
+    if (n == 0)
+        swprintf_s(pages, L" - not set up");
+    else
+        swprintf_s(pages, L" - %d page%ls", n, n == 1 ? L"" : L"s");
+    return std::wstring(who) + card + pages;
+}
+
+void WheelCharShow(int i) {
+    SendMessageW(g_w_char_list, CB_DELETESTRING, (WPARAM)i, 0);
+    SendMessageW(g_w_char_list, CB_INSERTSTRING, (WPARAM)i, (LPARAM)WheelCharText(i).c_str());
+    SetSel(g_w_char_list, g_w_char);
+}
+
+// One segment's list for the character shown: (empty), then what its class
+// can use in the game's order. An entry it cannot use (a hand-edited ini)
+// is added at the end, marked, so a Save keeps it.
+void WheelFillSegment(int s, wc::Entry cur) {
+    const HWND c = g_w_seg[s];
+    const int cls = WheelCurClass();
+    cur = wc::Clamped(cur);
+    SendMessageA(c, CB_RESETCONTENT, 0, 0);
+    auto add = [c](const char* text, wc::Entry e) {
+        const LRESULT i = SendMessageA(c, CB_ADDSTRING, 0, (LPARAM)text);
+        SendMessageA(c, CB_SETITEMDATA, (WPARAM)i, EntryData(e));
+    };
+    add(wc::kEmptyName, wc::Entry());
+    for (int t = 0; t < wc::kTrapCount; t++)
+        if (WheelCanUse(cls, wc::MakeTrap(t)))
+            add(wc::kTraps[t].name, wc::MakeTrap(t));
+    for (int id = 0; id < wc::kTechCount; id++)
+        if (WheelCanUse(cls, wc::MakeTechnique(id)))
+            add(wc::kTechs[id].name, wc::MakeTechnique(id));
+    if (!WheelCanUse(cls, cur)) {
+        char text[96];
+        UnusableText(cur, text, sizeof(text));
+        add(text, cur);
+    }
+    const int n = (int)SendMessageA(c, CB_GETCOUNT, 0, 0);
+    for (int i = 0; i < n; i++)
+        if (SendMessageA(c, CB_GETITEMDATA, (WPARAM)i, 0) == EntryData(cur))
+            SetSel(c, i);
+}
+
+// Shows the character and page selected: the eight lists, the page counter,
+// which buttons apply, and the character's text in the list. With no
+// character known yet everything about a wheel is greyed out.
+void WheelRefresh() {
+    WheelChar* w = WheelCur();
+    const bool have = w != nullptr;
+    static const wc::Layout none;
+    const wc::Layout& lay = have ? w->c.layout : none;
+    int shown = 0;
+    if (have) {
+        if (w->shown > lay.pages - 1) w->shown = lay.pages - 1;
+        if (w->shown < 0) w->shown = 0;
+        shown = w->shown;
+    }
+    const bool any = lay.pages > 0;
+    for (int s = 0; s < wc::kSegments; s++) {
+        WheelFillSegment(s, any ? lay.page[shown].seg[s] : wc::Entry());
+        EnableWindow(g_w_seg[s], any);
+    }
+    char counter[64];
+    if (!have)
+        snprintf(counter, sizeof(counter), "No characters yet");
+    else if (any)
+        snprintf(counter, sizeof(counter), "Page %d of %d", shown + 1, lay.pages);
+    else
+        snprintf(counter, sizeof(counter), "No pages - Add page, or Fill");
+    SetWindowTextA(g_w_counter, counter);
+    static int intro_shown = -1;
+    if (intro_shown != (have ? 1 : 0)) {
+        intro_shown = have ? 1 : 0;
+        SetWindowTextA(g_w_intro, have ? kWheelIntro : kWheelIntroEmpty);
+    }
+    const HWND focus = GetFocus();
+    EnableWindow(g_w_char_list, have);
+    EnableWindow(g_w_fill, have && WheelKnownClass(w->c.cls));
+    EnableWindow(g_w_prev, any && shown > 0);
+    EnableWindow(g_w_next, any && shown < lay.pages - 1);
+    EnableWindow(g_w_add, have && lay.pages < wc::kMaxPages);
+    EnableWindow(g_w_remove, any);
+    EnableWindow(g_w_clear, any);
+    // A button that just greyed out loses the focus to its neighbour, so
+    // the keyboard keeps working.
+    if (focus != nullptr && !IsWindowEnabled(focus)) {
+        HWND to = g_w_char_list;
+        if (focus == g_w_prev && IsWindowEnabled(g_w_next)) to = g_w_next;
+        else if (focus == g_w_next && IsWindowEnabled(g_w_prev)) to = g_w_prev;
+        else if (focus == g_w_add || focus == g_w_remove || focus == g_w_clear) to = g_w_add;
+        if (!IsWindowEnabled(to)) to = g_w_char_list;
+        SetFocus(IsWindowEnabled(to) ? to : g_w_knob[0]);
+    }
+    if (have)
+        WheelCharShow(g_w_char);
+}
+
+void WheelRefreshAll() {
+    SendMessageW(g_w_char_list, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < (int)g_w_chars.size(); i++)
+        SendMessageW(g_w_char_list, CB_ADDSTRING, 0, (LPARAM)WheelCharText(i).c_str());
+    if (g_w_char >= (int)g_w_chars.size()) g_w_char = (int)g_w_chars.size() - 1;
+    if (g_w_char < 0) g_w_char = 0;
+    SetSel(g_w_char_list, g_w_chars.empty() ? -1 : g_w_char);
+    WheelRefresh();
+}
+
+// Lists, in the log, every entry a character's class cannot use; they are
+// kept.
+void WheelNoteUnusable() {
+    for (const WheelChar& w : g_w_chars) {
+        const wc::Layout& lay = w.c.layout;
+        const std::string prefix = wc::CharPrefix(w.c.guild_card, w.c.slot);
+        for (int k = 0; k < lay.pages; k++)
+            for (int s = 0; s < wc::kSegments; s++) {
+                const wc::Entry e = lay.page[k].seg[s];
+                if (WheelCanUse(w.c.cls, e))
+                    continue;
+                char line[240];
+                snprintf(line, sizeof(line), "Spell wheel: %s at %s is %s, which %s cannot %s - kept "
+                         "as it is.", wc::PageKey(prefix, k + 1).c_str(), wc::kCompass[s],
+                         wc::NameOf(e), wc::kClasses[w.c.cls].name,
+                         e.kind == wc::Kind::Technique ? "learn" : "use");
+                AppendLog(line);
+            }
+    }
+}
+
+int WheelCharsSetUp() {
+    int n = 0;
+    for (const WheelChar& w : g_w_chars)
+        if (w.c.layout.pages > 0) n++;
+    return n;
+}
+
+// The [wheel] lines that are pages (<prefix>.<field>) in `section` text as
+// GetPrivateProfileSectionA returns it, in file order.
+std::vector<wc::KeyValue> PageLines(const char* section, DWORD n) {
+    std::vector<wc::KeyValue> out;
+    for (const char* p = section; n > 0 && *p != '\0'; p += strlen(p) + 1) {
+        const std::string line = wc::Trim(p);
+        if (line.empty() || line[0] == ';' || line[0] == '#')
+            continue;
+        wc::KeyValue kv;
+        if (wc::SplitLine(line, kv) && wc::IsLayoutKey(kv.key))
+            out.push_back(kv);
+    }
+    return out;
+}
+
+void RosterPath(char* out, size_t cap) {
+    char folder[MAX_PATH];
+    IniFolder(folder, sizeof(folder));
+    snprintf(out, cap, "%s%s%s", folder, folder[0] ? "\\" : "", wc::kRosterFile);
+}
+
+FILETIME RosterTime() {
+    char path[MAX_PATH + 32];
+    RosterPath(path, sizeof(path));
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad))
+        return FILETIME{};
+    return fad.ftLastWriteTime;
+}
+
+// Brings in the characters the game has listed (the characters file): a
+// new one joins the list with no pages, a known one takes the file's name,
+// class and level. The list stays sorted and the character shown stays
+// shown. Returns how many joined.
+int WheelMergeRoster() {
+    g_w_roster_time = RosterTime();
+    char path[MAX_PATH + 32];
+    RosterPath(path, sizeof(path));
+    static char names[32768];
+    names[0] = names[1] = '\0';
+    GetPrivateProfileSectionNamesA(names, sizeof(names), path);
+    const WheelChar* cur = WheelCur();
+    const unsigned cur_card = cur != nullptr ? cur->c.guild_card : 0;
+    const int cur_slot = cur != nullptr ? cur->c.slot : -1;
+    int added = 0;
+    for (const char* p = names; *p != '\0'; p += strlen(p) + 1) {
+        unsigned card = 0;
+        int slot = 0;
+        if (!wc::ParseCharPrefix(p, card, slot))
+            continue;
+        char name[128], cls_key[32];
+        GetPrivateProfileStringA(p, wc::kRosterName, "", name, sizeof(name), path);
+        GetPrivateProfileStringA(p, wc::kRosterClass, "", cls_key, sizeof(cls_key), path);
+        const int level = (int)GetPrivateProfileIntA(p, wc::kRosterLevel, 0, path);
+        const int cls = wc::FindClass(cls_key);
+        WheelChar* w = nullptr;
+        for (WheelChar& o : g_w_chars)
+            if (o.c.guild_card == card && o.c.slot == slot)
+                w = &o;
+        if (w == nullptr) {
+            WheelChar fresh;
+            fresh.c.guild_card = card;
+            fresh.c.slot = slot;
+            g_w_chars.push_back(fresh);
+            w = &g_w_chars.back();
+            added++;
+        }
+        if (name[0] != '\0')
+            w->c.name = name;
+        if (cls >= 0) {
+            if (w->c.cls >= 0 && w->c.cls != cls && w->c.layout.pages > 0) {
+                char line[240];
+                snprintf(line, sizeof(line), "Spell wheel: slot %d now holds a %s; the wheel saved "
+                         "for it was a %s's. It is shown as it is - Save keeps it for the new "
+                         "character.", slot + 1, wc::kClasses[cls].name, wc::kClasses[w->c.cls].name);
+                AppendLog(line);
+            }
+            w->c.cls = cls;
+        }
+        w->level = level > 0 && level <= 200 ? level : 0;
+    }
+    for (size_t i = 1; i < g_w_chars.size(); i++)   // few entries: an insertion sort
+        for (size_t j = i; j > 0; j--) {
+            const wc::CharLayout& a = g_w_chars[j - 1].c;
+            const wc::CharLayout& b = g_w_chars[j].c;
+            if (a.guild_card < b.guild_card || (a.guild_card == b.guild_card && a.slot <= b.slot))
+                break;
+            std::swap(g_w_chars[j - 1], g_w_chars[j]);
+        }
+    g_w_char = 0;
+    for (int i = 0; i < (int)g_w_chars.size(); i++)
+        if (g_w_chars[i].c.guild_card == cur_card && g_w_chars[i].c.slot == cur_slot)
+            g_w_char = i;
+    return added;
+}
+
+// The window came to the front: characters the game has listed since the
+// last look join the list. Nothing edited here is touched.
+void WheelRosterCheck() {
+    const FILETIME now = RosterTime();
+    if (CompareFileTime(&now, &g_w_roster_time) == 0)
+        return;
+    const int added = WheelMergeRoster();
+    WheelRefreshAll();
+    if (added > 0) {
+        char line[120];
+        snprintf(line, sizeof(line), "Spell wheel: %d new character(s) listed by the game.", added);
+        AppendLog(line);
+    }
+}
+
+void WheelLoad(bool announce) {
+    if (announce) ClearLog();
+    WheelReadClassTable();
+    for (int i = 0; i < kWheelKnobCount; i++) {
+        char v[64];
+        ReadIniValue(kWheelKnobs[i], v, sizeof(v));
+        KnobShow(kWheelKnobs[i], g_w_knob[i], v);
+    }
+    // The pages as the game reads them: psobbvr.ini's lines, then the
+    // defaults file's for keys psobbvr.ini leaves out.
+    static char buf[32768];
+    const DWORD n = settings::GetSection("wheel", buf, sizeof(buf), g_ini_path);
+    std::vector<std::string> warnings;
+    wc::Layouts parsed;
+    wc::ParseLayouts(PageLines(buf, n), parsed, warnings);
+    const WheelChar* cur = WheelCur();
+    const unsigned cur_card = cur != nullptr ? cur->c.guild_card : 0;
+    const int cur_slot = cur != nullptr ? cur->c.slot : -1;
+    g_w_chars.clear();
+    g_w_char = 0;
+    for (const wc::CharLayout& c : parsed.chars) {
+        WheelChar w;
+        w.c = c;
+        if (c.guild_card == cur_card && c.slot == cur_slot)
+            g_w_char = (int)g_w_chars.size();
+        g_w_chars.push_back(w);
+    }
+    AppendLog(g_w_levels_note);
+    WheelMergeRoster();
+    WheelRefreshAll();
+    for (const std::string& w : warnings)
+        AppendLog(("Spell wheel: " + w).c_str());
+    WheelNoteUnusable();
+    char status[MAX_PATH + 100];
+    if (g_w_chars.empty())
+        snprintf(status, sizeof(status), "%s  -  spell wheel loaded: no characters yet (enter the "
+                 "world with one once).", g_ini_path);
+    else
+        snprintf(status, sizeof(status), "%s  -  spell wheel loaded: %d character(s), %d set up.",
+                 g_ini_path, (int)g_w_chars.size(), WheelCharsSetUp());
+    SetStatus(status);
+    if (announce)
+        AppendLog("Loaded the ini's [wheel] section (each character's wheel as the game reads it) "
+                  "and the characters the game has listed.");
+}
+
+// psobbvr.ini's page lines become exactly SerializeLayouts' lines. When
+// they differ, every old one is removed and the new ones are written in
+// list order (WritePrivateProfileStringA takes a value of any length).
+bool WheelWritePages(int& written, int& removed) {
+    written = removed = 0;
+    static char buf[32768];
+    buf[0] = buf[1] = '\0';
+    const DWORD n = GetPrivateProfileSectionA("wheel", buf, sizeof(buf), g_ini_path);
+    const std::vector<wc::KeyValue> old = PageLines(buf, n);
+    wc::Layouts all;
+    for (const WheelChar& w : g_w_chars)
+        all.chars.push_back(w.c);
+    const std::vector<wc::KeyValue> now = wc::SerializeLayouts(all);
+    bool same = old.size() == now.size();
+    for (size_t i = 0; same && i < now.size(); i++)
+        same = wc::SameKey(old[i].key, now[i].key.c_str()) && old[i].value == now[i].value;
+    if (same)
+        return true;
+    for (const wc::KeyValue& kv : old) {
+        if (!WritePrivateProfileStringA("wheel", kv.key.c_str(), nullptr, g_ini_path))
+            return false;
+        bool kept = false;
+        for (const wc::KeyValue& k2 : now)
+            kept = kept || wc::SameKey(kv.key, k2.key.c_str());
+        if (!kept) removed++;
+    }
+    for (const wc::KeyValue& kv : now) {
+        if (!WritePrivateProfileStringA("wheel", kv.key.c_str(), kv.value.c_str(), g_ini_path))
+            return false;
+        written++;
+    }
+    return true;
+}
+
+void WheelSave() {
+    ClearLog();
+    // Validate the switches first; nothing is written if any is bad.
+    char values[kWheelKnobCount][64];
+    bool ok = true;
+    for (int i = 0; i < kWheelKnobCount; i++) {
+        char err[200];
+        if (!KnobCollect(kWheelKnobs[i], g_w_knob[i], values[i], sizeof(values[i]), err, sizeof(err))) {
+            AppendLog(err);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        AppendLog("Nothing saved - fix the value(s) above first.");
+        SetStatus("Not saved: a value is out of range.");
+        return;
+    }
+    if (!settings::EnsureUserFile(g_ini_path)) {
+        char msg[400];
+        snprintf(msg, sizeof(msg), "Could not create %s (error %lu). Is the folder read-only?",
+                 g_ini_path, GetLastError());
+        MessageBoxA(g_main, msg, "PSOBB VR Options", MB_ICONERROR);
+        return;
+    }
+    int changed = 0;
+    bool wrote = true;
+    for (int i = 0; wrote && i < kWheelKnobCount; i++) {
+        const Knob& k = kWheelKnobs[i];
+        char cur[64], def[64];
+        ReadIniValue(k, cur, sizeof(cur));
+        KnobDefault(k, def, sizeof(def));
+        // A switch at its default leaves psobbvr.ini, so it follows later
+        // releases again.
+        const bool at_default = settings::SameValue(values[i], def);
+        wrote = WriteUserValue(k.section, k.key, at_default ? nullptr : values[i]);
+        if (wrote && !settings::SameValue(cur, values[i])) {
+            char line[200];
+            snprintf(line, sizeof(line), "%s: %s -> %s%s", k.label, cur, values[i],
+                     at_default ? " (the default)" : "");
+            AppendLog(line);
+            changed++;
+        }
+    }
+    int written = 0, removed = 0;
+    if (!wrote || !WheelWritePages(written, removed)) {
+        char msg[400];
+        snprintf(msg, sizeof(msg), "Could not write %s (error %lu). Is the file read-only?",
+                 g_ini_path, GetLastError());
+        MessageBoxA(g_main, msg, "PSOBB VR Options", MB_ICONERROR);
+        return;
+    }
+    char rest[4] = "";
+    if (GetPrivateProfileSectionA("wheel", rest, sizeof(rest), g_ini_path) == 0)
+        WritePrivateProfileStringA("wheel", nullptr, nullptr, g_ini_path);
+    char line[400];
+    const int set_up = WheelCharsSetUp();
+    if (changed == 0 && written == 0 && removed == 0)
+        snprintf(line, sizeof(line), "Nothing changed - psobbvr.ini already holds this wheel "
+                 "(%d character(s) set up).", set_up);
+    else if (written == 0 && removed == 0)
+        snprintf(line, sizeof(line), "Saved: %d setting(s) changed, the pages unchanged (%d "
+                 "character(s) set up). A running game picks this up within about a second.",
+                 changed, set_up);
+    else
+        snprintf(line, sizeof(line), "Saved: %d line(s) written for %d character(s), %d old line(s) "
+                 "removed, %d setting(s) changed. A running game picks this up within about a second.",
+                 written, set_up, removed, changed);
+    AppendLog(line);
+    SetStatus(line);
+}
+
+void WheelDefaults() {
+    for (int i = 0; i < kWheelKnobCount; i++) {
+        char def[64];
+        KnobDefault(kWheelKnobs[i], def, sizeof(def));
+        KnobShow(kWheelKnobs[i], g_w_knob[i], def);
+    }
+    for (WheelChar& w : g_w_chars) {
+        w.c.layout = wc::Layout();
+        w.shown = 0;
+    }
+    WheelRefreshAll();
+    ClearLog();
+    AppendLog("Defaults restored in the editor: the wheel's settings, and every character's wheel "
+              "emptied - not saved yet.");
+}
+
+void WheelFill() {
+    WheelChar* w = WheelCur();
+    if (w == nullptr || !WheelKnownClass(w->c.cls))
+        return;
+    const int cls = w->c.cls;
+    w->c.layout = wc::FillLearnable(WheelLevels(cls));
+    w->shown = 0;
+    WheelRefresh();
+    const int n = w->c.layout.pages;
+    char line[200];
+    // "...with what a HUmar can learn" / "...with the traps a HUcast can use".
+    snprintf(line, sizeof(line), "The wheel filled with %s%s can %s: %d page%s - not saved yet.",
+             wc::IsAndroid(cls) ? "the traps a " : "what a ", wc::kClasses[cls].name,
+             wc::IsAndroid(cls) ? "use" : "learn", n, n == 1 ? "" : "s");
+    AppendLog(line);
+}
+
+// Add page / Remove this page / Clear this page.
+void WheelAddPage() {
+    WheelChar* w = WheelCur();
+    if (w == nullptr || w->c.layout.pages >= wc::kMaxPages)
+        return;
+    wc::Layout& lay = w->c.layout;
+    lay.page[lay.pages] = wc::Page();
+    lay.pages++;
+    w->shown = lay.pages - 1;
+    WheelRefresh();
+}
+
+void WheelRemovePage() {
+    WheelChar* w = WheelCur();
+    if (w == nullptr)
+        return;
+    wc::Layout& lay = w->c.layout;
+    const int k = w->shown;
+    if (lay.pages <= 0 || k < 0 || k >= lay.pages)
+        return;
+    for (int i = k; i < lay.pages - 1; i++)
+        lay.page[i] = lay.page[i + 1];
+    lay.pages--;
+    lay.page[lay.pages] = wc::Page();
+    WheelRefresh();
+}
+
+void WheelClearPage() {
+    WheelChar* w = WheelCur();
+    if (w == nullptr || w->shown < 0 || w->shown >= w->c.layout.pages)
+        return;
+    w->c.layout.page[w->shown] = wc::Page();
+    WheelRefresh();
+}
+
+void WheelSegmentPicked(int s) {
+    WheelChar* w = WheelCur();
+    const int i = Sel(g_w_seg[s]);
+    if (w == nullptr || w->shown < 0 || w->shown >= w->c.layout.pages || i < 0)
+        return;
+    w->c.layout.page[w->shown].seg[s] =
+        DataEntry(SendMessageA(g_w_seg[s], CB_GETITEMDATA, (WPARAM)i, 0));
+}
+
+void WheelShowPage(int delta) {
+    WheelChar* w = WheelCur();
+    if (w == nullptr)
+        return;
+    w->shown += delta;
+    WheelRefresh();
+}
+
+// The wheel page's WM_COMMAND notifications; focus on a control puts what
+// it does in the status line.
+void WheelCommand(int id, int code) {
+    const bool focus = code == EN_SETFOCUS || code == CBN_SETFOCUS || code == BN_SETFOCUS;
+    if (id == ID_W_CHAR) {
+        if (code == CBN_SELCHANGE && Sel(g_w_char_list) >= 0) {
+            g_w_char = Sel(g_w_char_list);
+            WheelRefresh();
+        } else if (focus) {
+            SetStatus("The character whose wheel is shown. Each character has its own wheel; Save "
+                      "writes them all.");
+        }
+        return;
+    }
+    if (id >= ID_W_SEG_FIRST && id < ID_W_SEG_FIRST + wc::kSegments) {
+        const int s = id - ID_W_SEG_FIRST;
+        if (code == CBN_SELCHANGE) {
+            WheelSegmentPicked(s);
+        } else if (focus) {
+            char line[200];
+            snprintf(line, sizeof(line), "The %s segment, at the %s of the ring, on the page shown. "
+                     "(empty) leaves it blank.", wc::kCompass[s], kSegWhere[s]);
+            SetStatus(line);
+        }
+        return;
+    }
+    if (id >= ID_W_KNOB_FIRST && id < ID_W_KNOB_FIRST + kWheelKnobCount) {
+        if (focus) {
+            const Knob& k = kWheelKnobs[id - ID_W_KNOB_FIRST];
+            char line[400];
+            snprintf(line, sizeof(line), "%s  (ini: [wheel] %s)", k.desc, k.key);
+            SetStatus(line);
+        }
+        return;
+    }
+    if (code != BN_CLICKED)
+        return;
+    switch (id) {
+    case ID_W_FILL: WheelFill(); break;
+    case ID_W_PREV: WheelShowPage(-1); break;
+    case ID_W_NEXT: WheelShowPage(+1); break;
+    case ID_W_ADD: WheelAddPage(); break;
+    case ID_W_REMOVE: WheelRemovePage(); break;
+    case ID_W_CLEAR: WheelClearPage(); break;
+    }
+}
+
+int BuildWheelPage(HWND page) {
+    int y = MARGIN;
+    g_w_intro = MakeLabel(page, kWheelIntro, MARGIN, y, PAGE_W - 2 * MARGIN, 36, g_font);
+    y += 46;
+    constexpr int CHAR_LBL = 68, CHAR_W = 380;
+    MakeLabel(page, "Character", MARGIN, y + 4, CHAR_LBL, 18, g_font);
+    g_w_char_list = MakeDropListW(page, ID_W_CHAR, MARGIN + CHAR_LBL, y + 1, CHAR_W);
+    g_w_fill = MakeButton(page, "Fill with what this class can learn", ID_W_FILL,
+                          MARGIN + CHAR_LBL + CHAR_W + 12, y, 250, 26);
+    y += 46;
+    // The eight segments as a compass, with the page counter and Prev /
+    // Next at the hub; columns centred on the page.
+    constexpr int SEG_LBL = 26, SEG_W = 190, CELL = SEG_LBL + 6 + SEG_W, GAP = 34;
+    const int x0 = (PAGE_W - (3 * CELL + 2 * GAP)) / 2;
+    const int col_x[3] = {x0, x0 + CELL + GAP, x0 + 2 * (CELL + GAP)};
+    const int row_y[3] = {y, y + 56, y + 124};
+    for (int s = 0; s < wc::kSegments; s++) {
+        const int x = col_x[kSegCol[s]], yy = row_y[kSegRow[s]];
+        MakeLabel(page, wc::kCompass[s], x, yy + 4, SEG_LBL, 18, g_font_bold, SS_RIGHT);
+        g_w_seg[s] = MakeDropList(page, ID_W_SEG_FIRST + s, x + SEG_LBL + 6, yy, SEG_W, nullptr, 0);
+    }
+    const int hub = col_x[1] + SEG_LBL + 6 + SEG_W / 2;   // under the N and S lists' centres
+    g_w_counter = MakeLabel(page, "", hub - 120, row_y[1] + 4, 240, 18, g_font_bold, SS_CENTER);
+    g_w_prev = MakeButton(page, "< Prev", ID_W_PREV, hub - 84, row_y[1] + 30, 80, 24);
+    g_w_next = MakeButton(page, "Next >", ID_W_NEXT, hub + 4, row_y[1] + 30, 80, 24);
+    y = row_y[2] + 42;
+    g_w_add = MakeButton(page, "Add page", ID_W_ADD, hub - 204, y, 120, 26);
+    g_w_remove = MakeButton(page, "Remove this page", ID_W_REMOVE, hub - 76, y, 152, 26);
+    g_w_clear = MakeButton(page, "Clear this page", ID_W_CLEAR, hub + 84, y, 120, 26);
+    y += 44;
+    // The switches: two columns, as on the VR page.
+    MakeLabel(page, "Wheel settings", MARGIN, y + 4, 300, 18, g_font_bold);
+    y += 26;
+    const int COL_W = (PAGE_W - 2 * MARGIN) / 2;
+    constexpr int kKnobCol[kWheelKnobCount] = {0, 1, 0, 1, 0};
+    constexpr int kKnobRow[kWheelKnobCount] = {0, 0, 1, 1, 2};
+    int rows = 0;
+    for (int i = 0; i < kWheelKnobCount; i++) {
+        HWND label_ctl = nullptr;
+        g_w_knob[i] = MakeKnob(page, kWheelKnobs[i], ID_W_KNOB_FIRST + i, MARGIN + kKnobCol[i] * COL_W,
+                               y + kKnobRow[i] * KNOB_ROW, COL_W, &label_ctl);
+        if (kKnobRow[i] + 1 > rows) rows = kKnobRow[i] + 1;
+    }
+    y += rows * KNOB_ROW;
     return y + MARGIN;
 }
 
@@ -1430,6 +2248,9 @@ void ShowPage(int idx) {
     case PAGE_VR:
         SetStatus("VR settings - Save writes psobbvr.ini; changes take effect the next time the game starts.");
         break;
+    case PAGE_WHEEL:
+        SetStatus("Spell wheel - Save writes the ini's [wheel] section; the running game reloads it within a second.");
+        break;
     }
 }
 
@@ -1438,8 +2259,9 @@ void LoadAllPages() {
     GameLoad(false);
     VrLoad(false);
     ClearLog();
-    AppendLog("Loaded: controller bindings and VR settings from psobbvr.ini and psobbvr-defaults.ini, "
-              "game options from the registry.");
+    AppendLog("Loaded: controller bindings, VR settings and the spell wheel from psobbvr.ini and "
+              "psobbvr-defaults.ini, game options from the registry.");
+    WheelLoad(false);   // adds its own notes to the log
     if (g_tidy_note[0] != '\0') {
         AppendLog(g_tidy_note);
         g_tidy_note[0] = '\0';
@@ -1599,7 +2421,7 @@ void BuildUi(HWND wnd) {
     g_tab = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
                             0, 0, S(PAGE_W), S(TAB_H + 4), wnd, nullptr, inst, nullptr);
     SendMessageA(g_tab, WM_SETFONT, (WPARAM)g_font, TRUE);
-    const char* names[PAGE_COUNT] = {"Controller bindings", "Game options", "VR settings"};
+    const char* names[PAGE_COUNT] = {"Controller bindings", "Game options", "VR settings", "Spell wheel"};
     for (int i = 0; i < PAGE_COUNT; i++) {
         TCITEMA it = {};
         it.mask = TCIF_TEXT;
@@ -1610,7 +2432,8 @@ void BuildUi(HWND wnd) {
         g_page[i] = CreateWindowExA(0, "PsobbvrOptionsPage", "", WS_CHILD | WS_CLIPSIBLINGS,
                                     0, 0, S(PAGE_W), S(100), wnd, nullptr, inst, nullptr);
         const int h = i == PAGE_BINDINGS ? BuildBindingsPage(g_page[i])
-                    : i == PAGE_GAME ? BuildGamePage(g_page[i]) : BuildVrPage(g_page[i]);
+                    : i == PAGE_GAME ? BuildGamePage(g_page[i])
+                    : i == PAGE_VR ? BuildVrPage(g_page[i]) : BuildWheelPage(g_page[i]);
         g_page_content[i] = S(h);
     }
     MakeButton(wnd, "Check", ID_CHECK, 0, 0, 90, 26);
@@ -1676,6 +2499,7 @@ void OnSave() {
     case PAGE_BINDINGS: BindingsSave(); break;
     case PAGE_GAME: GameSave(); break;
     case PAGE_VR: VrSave(); break;
+    case PAGE_WHEEL: WheelSave(); break;
     }
 }
 void OnReload() {
@@ -1683,6 +2507,7 @@ void OnReload() {
     case PAGE_BINDINGS: BindingsLoad(true); break;
     case PAGE_GAME: GameLoad(true); break;
     case PAGE_VR: VrLoad(true); break;
+    case PAGE_WHEEL: WheelLoad(true); break;
     }
 }
 void OnDefaults() {
@@ -1690,6 +2515,7 @@ void OnDefaults() {
     case PAGE_BINDINGS: BindingsDefaults(); break;
     case PAGE_GAME: GameDefaultsToUi(); break;
     case PAGE_VR: VrDefaults(); break;
+    case PAGE_WHEEL: WheelDefaults(); break;
     }
 }
 
@@ -1698,6 +2524,8 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         NoteOnClick();
     if (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE && g_note_up >= 0)
         ShowNote(g_note_up, false);   // clicked into another program
+    if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE && g_ui_ready)
+        WheelRosterCheck();           // the game may have listed a character meanwhile
     switch (msg) {
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) Layout();
@@ -1766,6 +2594,10 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        if (id >= ID_W_CHAR && id < ID_W_KNOB_FIRST + kWheelKnobCount) {
+            WheelCommand(id, code);
+            return 0;
+        }
         break;
     }
     case WM_MOUSEWHEEL:
@@ -1782,8 +2614,8 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int g_start_page = PAGE_BINDINGS;
 
-// Command line: [ini path] [--page bindings|game|vr]. The --page switch
-// opens on that page (for shortcuts and for screenshots).
+// Command line: [ini path] [--page bindings|game|vr|wheel]. The --page
+// switch opens on that page (for shortcuts and for screenshots).
 bool ResolveIniPath(const char* cmdline_in) {
     char cmdline[1024] = "";
     if (cmdline_in != nullptr) strncpy_s(cmdline, cmdline_in, sizeof(cmdline) - 1);
@@ -1792,6 +2624,7 @@ bool ResolveIniPath(const char* cmdline_in) {
         while (*v == ' ' || *v == '=') v++;
         if (_strnicmp(v, "game", 4) == 0) g_start_page = PAGE_GAME;
         else if (_strnicmp(v, "vr", 2) == 0) g_start_page = PAGE_VR;
+        else if (_strnicmp(v, "wheel", 5) == 0) g_start_page = PAGE_WHEEL;
         else g_start_page = PAGE_BINDINGS;
         *pg = '\0';   // the rest (if any) is the ini path
     }

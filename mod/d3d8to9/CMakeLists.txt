@@ -21,6 +21,12 @@ set(D3D8TO9_SOURCE
   source/psobbvr_probe.hpp
   source/psobbvr_bindings_core.hpp
   source/psobbvr_bindings.hpp
+  source/psobbvr_wheel_core.hpp
+  source/psobbvr_wheel_config.hpp
+  source/psobbvr_wheel.hpp
+  source/psobbvr_wheel_ui.hpp
+  source/psobbvr_wheel_input.hpp
+  source/psobbvr_wheel_draw.hpp
   source/psobbvr_resolution.hpp
   source/psobbvr_stereo.hpp
   source/psobbvr_d3d9ex.hpp
@@ -28,6 +34,13 @@ set(D3D8TO9_SOURCE
   source/psobbvr_vr_openvr.cpp
   source/psobbvr_vr_openxr.cpp
   source/psobbvr_log.hpp
+  source/psobbvr_handclose_core.hpp
+  source/psobbvr_handclose_adapt.hpp
+  source/psobbvr_handclose.hpp
+  source/psobbvr_handweld.hpp
+  source/psobbvr_handref.hpp
+  source/psobbvr_weaponsnap_core.hpp
+  source/psobbvr_weaponsnap.hpp
   res/d3d8.def
   res/d3d8to9.rc
 )

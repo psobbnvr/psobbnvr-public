@@ -29,6 +29,10 @@
 #include <cstdint>
 #include <cstring>
 
+#include "psobbvr_eyeheight.hpp"
+#include "psobbvr_handref.hpp"
+#include "psobbvr_handweld.hpp"
+#include "psobbvr_ikarms.hpp"
 #include "psobbvr_partmap.hpp"
 #include "psobbvr_weapongrip.hpp"
 
@@ -155,6 +159,37 @@ constexpr KnownBand KNOWN_BANDS[] = {
     {11, 37, 46, 37, 46, "RAmarl"},     // clean run
 };
 constexpr int RUN_FIRST_SLACK = 6;
+// BEGIN hand band tables (generated)
+// The left hand's band per class: the numbered body draws its glove mesh
+// (the node on bone 34, the right hand's 47) arrives as, wrist cuffs left
+// out. Generated: do not edit by hand. The right hand's bands are
+// KNOWN_BANDS above.
+struct HandBandRow {
+    int class_id;
+    int first, last;   // draw numbers, from 1
+};
+constexpr HandBandRow LEFT_BANDS[CLASS_COUNT] = {
+    { 0, 25, 34},  // HUmar
+    { 1, 8, 18},  // HUnewearl
+    { 2, 25, 38},  // HUcast
+    { 3, 16, 25},  // RAmar
+    { 4, 26, 36},  // RAcast
+    { 5, 19, 29},  // RAcaseal
+    { 6, 23, 32},  // FOmarl
+    { 7, 13, 21},  // FOnewm
+    { 8, 23, 35},  // FOnewearl
+    { 9, 20, 27},  // HUcaseal
+    {10, 19, 30},  // FOmar
+    {11, 18, 26},  // RAmarl
+};
+// Draws right after a band that the game draws before the walk has written
+// the grip bone (the wrist cuffs left out of the band): the capture reads the
+// grip bone's frame only after them. Per class, [0] left, [1] right.
+constexpr unsigned char IK_RESOLVE_DELAY[2][CLASS_COUNT] = {
+    {0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0},  // left
+    {0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0},  // right
+};
+// END hand band tables (generated)
 // The player's class byte, or -1 when the entity cannot be read.
 inline int ReadPlayerClass() {
     const uintptr_t entity = gamecam::ResolveEntity();
@@ -378,7 +413,8 @@ inline void PublishArrayBone() {
                 } else if (d < 0.5f || (best_i >= 0 && best_d < 0.5f)) {
                     diag::Log("handbone: this weapon's first matrix is turned %.1f deg on bone %d (a model with its own node transform) - index kept, check deferred to the next weapon",
                               d < 0.5f ? deg : best_deg, d < 0.5f ? hand_bone_index : best_i);
-                    hand_bone_checked_weapon = nullptr;   // no verdict from this weapon
+                    // No verdict from this weapon; it stays marked as checked
+                    // so the scan does not repeat every draw until it changes.
                 } else {
                     diag::Log("handbone: WARNING bone %d is %.2f units off the bracket and no bone matches (best %d at %.2f) - unarmed captures would be wrong on this model",
                               hand_bone_index, d, best_i, best_d);
@@ -403,11 +439,500 @@ inline void PublishArrayBone() {
 }
 
 
+// ---- IK-arms mode: both hands as the game draws them
+// With ik_arms on, the game poses and draws both hands with the bones the IK
+// writes. A hand is one rigid mesh on its glove node, so its shape in the
+// grip point's frame never changes: the first complete band run gives it,
+// with no settle wait, whatever the controllers are doing. Per hand (0 =
+// left, 1 = right, as the controllers and ikarms::ARM_BONES) the capture
+// moves the band's vertices into the grip frame, welds them (handweld) and
+// keeps the welded mesh; every body run then records the transform from that
+// frame to the run's root-local space, which is what a later per-vertex
+// change needs to be written back into the band's draws.
+//
+// The bands: the right hand's is KNOWN_BANDS, the left's LEFT_BANDS, at the
+// tables' own draw numbers. The replay capture's learned shift is not
+// applied: a classifier run that ends a draw early would read as a shift.
+// A mesh is replaced after the player has been out of gameplay a while,
+// when the class changes, or when a band draw stops matching it.
+//
+// The grip bone's frame is read from the bone array, which a body run's first
+// draw finds holding the previous walk's matrices: the walk writes each bone
+// as it reaches it, and draws the bone's mesh right after. So a capture is
+// taken in two steps. The band's draws are collected as drawn (root-local),
+// and the grip frame is read at the first draw after the band, when the walk
+// has written the grip bone, and only then are the vertices moved into it.
+// The finished capture is then held against the reference hand of the
+// class's build (psobbvr_handref.hpp) and kept only if it matches.
+constexpr int IK_FAIL_BACKOFF_RUNS = 60;   // body runs to wait after a rejected capture
+constexpr int IK_MAX_TRIES = 6;            // rejected captures before the retries slow down
+constexpr int IK_SLOW_BACKOFF_RUNS = 300;  // body runs between retries after that
+constexpr float IK_BOX_MIN = 0.5f;         // the hand's box: each axis between these (units)
+constexpr float IK_BOX_MAX = 5.0f;
+constexpr int IK_MIN_WELDED = 12;          // a hand welds to 29-36 vertices, 52-68 triangles
+constexpr int IK_MIN_TRIS = 20;
+
+struct IkHand {
+    bool have;           // a welded mesh is held
+    bool stale;          // it is to be replaced by the next clean capture
+    uint32_t generation; // counts the captures kept (changes when one replaces another)
+    int class_id;        // the class the mesh came from
+    int first, last;     // the band's draw numbers it came from
+    int cap_count;       // band draws collected in the run in flight
+    float frame_lag;     // how far the previous walk's grip frame was from the fresh one (units)
+    bool capturing;
+    bool finish_pending;   // the band is collected; the grip frame is read at the next draw
+    int tries, backoff;
+    unsigned stride[handweld::MAX_DRAWS];   // per band draw, for the substitution's check
+    DWORD fvf[handweld::MAX_DRAWS];
+    handweld::Mesh mesh;                    // welded, in the grip point's frame
+    // This body run's frame and band (valid from the run's first draw).
+    bool pass_valid;
+    int run_first, run_last;   // the band's draw numbers this run
+    int run_resolve;           // the capture's grip frame is read at the first draw after this one
+    D3DMATRIX run_root;        // the body root matrix of this run
+    D3DMATRIX to_grip;         // root-local -> grip frame: bodyRoot x inverse(gripBoneWorld)
+    D3DMATRIX to_root;         // grip frame -> root-local: the rigid inverse
+    float rot[9];              // to_root's rotation, row-vector order
+    // The shape change the substitution applies (SetReshape).
+    const float (*moves)[3];
+    const float (*normals)[3];
+    const float (*turns)[9];   // set: SubstituteTurned, the normals unused
+    uint32_t moves_generation;
+};
+inline IkHand ik_hand[2];
+inline int ik_run = 0;                  // body runs begun (any pass)
+inline int ik_gap_passes = 0;           // passes out of gameplay
+inline bool ik_recapture_request = false;   // capture both hands again
+constexpr int IK_LOG_BUDGET = 40;       // capture lines per character
+inline int ik_log_budget = IK_LOG_BUDGET;
+inline int ik_run_class = -1;           // the class of the last body run
+inline int band_shift = 0;              // the replay capture's learned shift from KNOWN_BANDS (AutoStep); reported only
+// Capture scratch: the band's positions in the grip frame, and each draw's
+// shape.
+struct IkScratchDraw {
+    int type;
+    unsigned prims, verts, stride;
+    DWORD fvf;
+};
+inline float ik_scratch_pos[2][handweld::MAX_DRAWS][handweld::MAX_VERTS][3];
+inline IkScratchDraw ik_scratch_draw[2][handweld::MAX_DRAWS];
+inline handweld::Mesh ik_mesh_tmp;
+
+inline const char* IkSideName(int side) { return side == 0 ? "left" : "right"; }
+inline const char* const ik_hold_name[3] = {"unrecorded", "held", "recording"};
+
+// The band's draw numbers of a hand for a class. False for a class with no
+// row.
+inline bool IkBandFor(int side, int class_id, int& first, int& last) {
+    if (class_id < 0)
+        return false;
+    if (side == 1) {
+        const KnownBand* k = MatchKnownBandByClass(class_id);
+        if (k == nullptr)
+            return false;
+        first = k->first;
+        last = k->last;
+        return true;
+    }
+    for (const HandBandRow& r : LEFT_BANDS) {
+        if (r.class_id == class_id) {
+            first = r.first;
+            last = r.last;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A body run's first draw: this run's grip frames and bands. The bone array
+// holds the IK-posed bones of the walk that just ran.
+inline void IkBeginRun() {
+    ik_run++;
+    const int class_id = ReadPlayerClass();
+    const D3DMATRIX body_root = partmap::current_world;
+    if (class_id >= 0 && class_id != ik_run_class) {
+        // Another character: its captures start over at once, whatever the
+        // last one's were doing, and are logged afresh.
+        if (ik_run_class >= 0) {
+            ik_log_budget = IK_LOG_BUDGET;
+            for (IkHand& h : ik_hand) {
+                h.tries = 0;
+                h.backoff = 0;
+            }
+        }
+        ik_run_class = class_id;
+    }
+    for (int side = 0; side < 2; side++) {
+        IkHand& h = ik_hand[side];
+        h.pass_valid = false;
+        h.run_root = body_root;
+        if (h.finish_pending) {
+            // The run ended before the draw that reads the frame.
+            h.finish_pending = false;
+            h.capturing = false;
+        }
+        if (class_id < 0)
+            continue;
+        if (h.have && !h.stale && h.class_id != class_id) {
+            h.stale = true;
+            h.tries = 0;
+            h.backoff = 0;
+            if (ik_log_budget > 0) {
+                ik_log_budget--;
+                diag::Log("ikhand: %s hand's class changed %d -> %d - mesh to be replaced",
+                          IkSideName(side), h.class_id, class_id);
+            }
+        }
+        D3DMATRIX grip_world;
+        if (!ArrayBoneWorld(ikarms::ARM_BONES[side].grip, grip_world))
+            continue;
+        if (!IkBandFor(side, class_id, h.run_first, h.run_last))
+            continue;
+        h.run_resolve = h.run_last + (class_id < CLASS_COUNT ? IK_RESOLVE_DELAY[side][class_id] : 0);
+        h.to_grip = vrmod::Multiply(body_root, vrmod::RigidInverse(grip_world));
+        h.to_root = vrmod::RigidInverse(h.to_grip);
+        h.rot[0] = h.to_root._11; h.rot[1] = h.to_root._12; h.rot[2] = h.to_root._13;
+        h.rot[3] = h.to_root._21; h.rot[4] = h.to_root._22; h.rot[5] = h.to_root._23;
+        h.rot[6] = h.to_root._31; h.rot[7] = h.to_root._32; h.rot[8] = h.to_root._33;
+        h.pass_valid = true;
+    }
+}
+
+// A capture is dropped; the next try waits, and after IK_MAX_TRIES rejections
+// in a row the retries only slow down, so a hand is never locked out for good.
+// Rejections are logged for the first tries and then every tenth.
+inline void IkReject(int side, const char* why, float error = -1.0f) {
+    IkHand& h = ik_hand[side];
+    h.capturing = false;
+    h.finish_pending = false;
+    h.tries++;
+    h.backoff = h.tries >= IK_MAX_TRIES ? IK_SLOW_BACKOFF_RUNS : IK_FAIL_BACKOFF_RUNS;
+    if (ik_log_budget > 0 && (h.tries <= IK_MAX_TRIES || h.tries % 10 == 0)) {
+        ik_log_budget--;
+        if (error >= 0.0f)
+            diag::Log("ikhand: %s hand capture REJECTED (%s, %.3f units off the reference), try %d",
+                      IkSideName(side), why, error, h.tries);
+        else
+            diag::Log("ikhand: %s hand capture REJECTED (%s), try %d", IkSideName(side), why,
+                      h.tries);
+    }
+}
+
+// The reference hand of the seeded character for a side and class, as the
+// nine numbers handref::Stats gives a capture. False without the pad
+// position (no proportion seed, or one for another class).
+inline bool IkReference(int side, int class_id, float want[handref::STATS]) {
+    handref::Weights w;
+    if (!eyeheight::SeedPadWeights(class_id, w.shape, w.w, w.kept))
+        return false;
+    handref::Expected(side, class_id, w, want);
+    return true;
+}
+
+// The band's last draw has been collected: weld, validate, keep.
+inline void IkFinish(int side, int class_id) {
+    IkHand& h = ik_hand[side];
+    h.capturing = false;
+    handweld::DrawIn in[handweld::MAX_DRAWS];
+    float mn[3] = {1e9f, 1e9f, 1e9f}, mx[3] = {-1e9f, -1e9f, -1e9f};
+    for (int d = 0; d < h.cap_count; d++) {
+        in[d].type = ik_scratch_draw[side][d].type;
+        in[d].prims = ik_scratch_draw[side][d].prims;
+        in[d].verts = ik_scratch_draw[side][d].verts;
+        in[d].pos = &ik_scratch_pos[side][d][0][0];
+        for (unsigned v = 0; v < in[d].verts; v++)
+            for (int a = 0; a < 3; a++) {
+                const float c = ik_scratch_pos[side][d][v][a];
+                if (c < mn[a]) mn[a] = c;
+                if (c > mx[a]) mx[a] = c;
+            }
+    }
+    for (int a = 0; a < 3; a++) {
+        const float span = mx[a] - mn[a];
+        if (span < IK_BOX_MIN || span > IK_BOX_MAX) {
+            IkReject(side, "its box is not hand-sized");
+            return;
+        }
+    }
+    // The reference check: three means of the vertices against the class's
+    // build blended from the creation pad. Without the pad position, against
+    // the range the class's shapes span.
+    float stats[handref::STATS], want[handref::STATS];
+    unsigned vert_counts[handweld::MAX_DRAWS];
+    for (int d = 0; d < h.cap_count; d++)
+        vert_counts[d] = ik_scratch_draw[side][d].verts;
+    float ref_error = 0.0f;
+    bool by_pad = false;
+    if (class_id < 0 || class_id >= 12 ||
+        !handref::Stats(ik_scratch_pos[side], vert_counts, h.cap_count, stats)) {
+        IkReject(side, "its class or vertices are unusable");
+        return;
+    }
+    if (IkReference(side, class_id, want)) {
+        by_pad = true;
+        ref_error = handref::Error(stats, want);
+    } else {
+        ref_error = handref::OutsideClassRange(side, class_id, stats);
+    }
+    if (ref_error > handref::TOLERANCE) {
+        IkReject(side, by_pad ? "it is not the hand of the pad's build"
+                              : "it lies outside the class's hands", ref_error);
+        return;
+    }
+    if (!handweld::Build(ik_mesh_tmp, in, h.cap_count)) {
+        IkReject(side, "the welding failed");
+        return;
+    }
+    if (ik_mesh_tmp.vertex_count < IK_MIN_WELDED || ik_mesh_tmp.tri_count < IK_MIN_TRIS) {
+        IkReject(side, "too few welded vertices or triangles");
+        return;
+    }
+    memcpy(&h.mesh, &ik_mesh_tmp, sizeof(handweld::Mesh));
+    for (int d = 0; d < h.cap_count; d++) {
+        h.stride[d] = ik_scratch_draw[side][d].stride;
+        h.fvf[d] = ik_scratch_draw[side][d].fvf;
+    }
+    h.have = true;
+    h.stale = false;
+    h.finish_pending = false;
+    h.generation++;
+    h.class_id = class_id;
+    h.first = h.run_first;
+    h.last = h.run_last;
+    h.tries = 0;
+    h.backoff = 0;
+    if (ik_log_budget > 0) {
+        ik_log_budget--;
+        diag::Log("ikhand: %s hand CAPTURED class %d band d%d..d%d, %d draws, %d welded vertices, "
+                  "%d triangles, grip-frame box x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f], generation %u, "
+                  "%.3f units from the %s reference, frame lag %.3f, grip %s",
+                  IkSideName(side), class_id, h.first, h.last, h.cap_count, h.mesh.vertex_count,
+                  h.mesh.tri_count, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], (unsigned)h.generation,
+                  ref_error, by_pad ? "pad" : "class-range", h.frame_lag,
+                  ik_hold_name[ikarms::HandHoldState(side)]);
+    }
+}
+
+// The first draw after a band and the wrist cuffs the game draws with its
+// glove node (IK_RESOLVE_DELAY): the walk has written the grip bone, so the
+// frame read now is the one the band's vertices were skinned with. Moves the
+// collected vertices into it and finishes the capture.
+inline void IkResolve(int side) {
+    IkHand& h = ik_hand[side];
+    h.finish_pending = false;
+    D3DMATRIX grip_world;
+    if (!ArrayBoneWorld(ikarms::ARM_BONES[side].grip, grip_world)) {
+        IkReject(side, "the grip bone is unreadable");
+        return;
+    }
+    const D3DMATRIX fresh = vrmod::Multiply(h.run_root, vrmod::RigidInverse(grip_world));
+    // The earlier frame (read at the run's first draw) against this one, in
+    // the grip frame's units: the translation of fresh x inverse(earlier).
+    const D3DMATRIX lag = vrmod::Multiply(fresh, vrmod::RigidInverse(h.to_grip));
+    h.frame_lag = sqrtf(lag._41 * lag._41 + lag._42 * lag._42 + lag._43 * lag._43);
+    const D3DMATRIX& m = fresh;
+    for (int d = 0; d < h.cap_count; d++)
+        for (unsigned i = 0; i < ik_scratch_draw[side][d].verts; i++) {
+            float* o = ik_scratch_pos[side][d][i];
+            const float x = o[0], y = o[1], z = o[2];
+            o[0] = x * m._11 + y * m._21 + z * m._31 + m._41;
+            o[1] = x * m._12 + y * m._22 + z * m._32 + m._42;
+            o[2] = x * m._13 + y * m._23 + z * m._33 + m._43;
+        }
+    IkFinish(side, ReadPlayerClass());
+}
+
+// One body-run draw (from CaptureObserve, before the arm hide counts it).
+inline void IkObserve(const void* data, UINT stride, UINT verts, D3DPRIMITIVETYPE type,
+                      UINT prims, DWORD fvf) {
+    if (!ikarms::Active() || !partmap::body_run_open || data == nullptr)
+        return;
+    if (partmap::body_run_draws == 0)
+        IkBeginRun();
+    const int idx = partmap::body_run_draws + 1;
+    for (int side = 0; side < 2; side++) {
+        IkHand& h = ik_hand[side];
+        if (!h.pass_valid)
+            continue;
+        if (h.finish_pending && idx > h.run_resolve)
+            IkResolve(side);
+        if (idx < h.run_first || idx > h.run_last)
+            continue;
+        const int ord = idx - h.run_first;
+        if (h.have && !h.stale) {
+            // Held: the draw must still be the one the mesh came from.
+            if (h.first == h.run_first && h.last == h.run_last && ord < h.mesh.draw_count &&
+                h.mesh.draws[ord].verts == verts && h.mesh.draws[ord].prims == prims &&
+                h.mesh.draws[ord].type == (int)type && h.stride[ord] == stride && h.fvf[ord] == fvf)
+                continue;
+            h.stale = true;
+            h.tries = 0;
+            h.backoff = 0;
+            if (ik_log_budget > 0) {
+                ik_log_budget--;
+                diag::Log("ikhand: %s hand's band draw d%d no longer matches the mesh (verts %u, was %u) - mesh to be replaced",
+                          IkSideName(side), idx, (unsigned)verts,
+                          ord < h.mesh.draw_count ? h.mesh.draws[ord].verts : 0u);
+            }
+            continue;
+        }
+        if (idx == h.run_first && h.backoff > 0)
+            h.backoff--;
+        if (h.backoff > 0)
+            continue;
+        if (idx == h.run_first) {
+            h.cap_count = 0;
+            h.capturing = true;
+        }
+        if (!h.capturing)
+            continue;
+        if (ord != h.cap_count || ord >= handweld::MAX_DRAWS || verts == 0 ||
+            verts > (UINT)handweld::MAX_VERTS || stride < 12 || stride > (UINT)handweld::MAX_STRIDE) {
+            IkReject(side, "a band draw is out of order or too big");
+            continue;
+        }
+        IkScratchDraw& sd = ik_scratch_draw[side][ord];
+        sd.type = (int)type;
+        sd.prims = prims;
+        sd.verts = verts;
+        sd.stride = stride;
+        sd.fvf = fvf;
+        // Root-local for now; IkResolve moves them into the grip frame.
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        for (UINT i = 0; i < verts; i++, p += stride) {
+            const float* v = reinterpret_cast<const float*>(p);
+            float* o = ik_scratch_pos[side][ord][i];
+            o[0] = v[0];
+            o[1] = v[1];
+            o[2] = v[2];
+        }
+        h.cap_count++;
+        if (idx == h.run_last)
+            h.finish_pending = true;
+    }
+}
+
+// Once per pass: the staleness rules and a pending recapture request.
+inline void IkOnFrame() {
+    if (ik_recapture_request) {
+        ik_recapture_request = false;
+        for (IkHand& h : ik_hand) {
+            if (h.have)
+                h.stale = true;
+            h.tries = 0;
+            h.backoff = 0;
+        }
+        ik_log_budget = IK_LOG_BUDGET;
+        diag::Log("ikhand: recapture requested - both meshes to be replaced");
+    }
+    if (ikarms::Active()) {
+        ik_gap_passes = 0;
+        return;
+    }
+    if (ik_gap_passes < 100000)
+        ik_gap_passes++;
+    if (ik_gap_passes == STALE_GAP_PASSES) {
+        for (IkHand& h : ik_hand) {
+            if (h.have)
+                h.stale = true;
+            h.tries = 0;
+            h.backoff = 0;
+        }
+    }
+}
+
+// What the reshaping stage reads. side: 0 = left, 1 = right.
+struct IkWelded {
+    bool valid;                    // a mesh is held and is not due for replacement
+    uint32_t generation;           // changes whenever a capture replaces the mesh
+    int class_id;
+    int first, last;               // the band's draw numbers
+    const handweld::Mesh* mesh;    // positions in the grip point's frame, triangles, per-draw map
+};
+inline IkWelded Welded(int side) {
+    const IkHand& h = ik_hand[side & 1];
+    return {h.have && !h.stale, h.generation, h.class_id, h.first, h.last, &h.mesh};
+}
+// This body run's transform from the hand's grip frame to root-local space
+// (valid once the run's first draw has been seen, until the next run).
+inline bool IkGripToRoot(int side, D3DMATRIX& out) {
+    const IkHand& h = ik_hand[side & 1];
+    if (!h.pass_valid)
+        return false;
+    out = h.to_root;
+    return true;
+}
+// Which draw of the hand's band this run's draw number is (0-based), or -1:
+// not in the band, or no mesh to map it with.
+inline int IkBandDraw(int side, int draw_number) {
+    const IkHand& h = ik_hand[side & 1];
+    if (!h.have || h.stale || !h.pass_valid || h.first != h.run_first || h.last != h.run_last ||
+        draw_number < h.first || draw_number > h.last)
+        return -1;
+    return draw_number - h.first;
+}
+
+// The shape change to write into the hand's band draws: one move per welded
+// vertex in the grip frame (and optionally a normal per welded vertex in the
+// same frame), valid for the mesh generation given. The arrays are the
+// caller's and must stay put until replaced; null moves clears it.
+// With turns (one 3x3 rotation per welded vertex in the grip frame, row-vector
+// order, identity or zeros for none) the draws go through
+// handweld::SubstituteTurned: the moves are the whole displacement, the
+// game's own normals are turned, and normals is not used. Without turns, the
+// moved vertices take the given welded normals (handweld::Substitute).
+inline void IkSetReshape(int side, const float (*moves)[3], const float (*normals)[3],
+                         uint32_t generation, const float (*turns)[9] = nullptr) {
+    IkHand& h = ik_hand[side & 1];
+    h.moves = moves;
+    h.normals = normals;
+    h.turns = turns;
+    h.moves_generation = generation;
+}
+// The master switch for the substitution: off, SubstituteBandDraw returns its
+// input.
+inline bool ik_reshape_enabled = false;
+
+inline uint8_t ik_subst_buffer[2][handweld::MAX_VERTS * handweld::MAX_STRIDE];
+
+// The proxy's one call: the draw's vertex data, or - when the reshaping is
+// on, this draw is in a hand's band, the band mesh is current and a shape
+// change is set for it - a copy with the welded vertices moved. The game's
+// buffer (its skinning cache) is never written. Call it before the arm hide
+// counts the draw.
+inline const void* SubstituteBandDraw(const void* data, UINT stride, UINT verts,
+                                      D3DPRIMITIVETYPE type, UINT prims, DWORD fvf) {
+    if (!ik_reshape_enabled || data == nullptr || !partmap::body_run_open)
+        return data;
+    const int idx = partmap::body_run_draws + 1;
+    for (int side = 0; side < 2; side++) {
+        const IkHand& h = ik_hand[side];
+        const int ord = IkBandDraw(side, idx);
+        if (ord < 0 || h.moves == nullptr || h.moves_generation != h.generation)
+            continue;
+        const handweld::Draw& d = h.mesh.draws[ord];
+        if (d.verts != verts || d.prims != prims || d.type != (int)type || h.stride[ord] != stride ||
+            h.fvf[ord] != fvf)
+            continue;
+        const bool has_normal = (fvf & D3DFVF_NORMAL) != 0;
+        if (h.turns != nullptr)
+            handweld::SubstituteTurned(d, static_cast<const uint8_t*>(data), stride, has_normal,
+                                       h.moves, h.turns, h.rot, ik_subst_buffer[side]);
+        else
+            handweld::Substitute(d, static_cast<const uint8_t*>(data), stride, has_normal,
+                                 h.moves, h.normals, h.rot, ik_subst_buffer[side]);
+        return ik_subst_buffer[side];
+    }
+    return data;
+}
+
 // One body-run user-pointer draw (device UP path, just before
 // HideArmDrawNow, so it also sees draws the arm hide then drops).
 inline void CaptureObserve(IDirect3DDevice9* dev, const void* data,
                            UINT stride, UINT verts, D3DPRIMITIVETYPE type,
                            UINT prims, DWORD fvf) {
+    IkObserve(data, stride, verts, type, prims, fvf);
     if (!cap_this_pass || !partmap::body_run_open || data == nullptr ||
         stride < 12 || stride > MAX_STRIDE || verts == 0)
         return;
@@ -519,6 +1044,7 @@ inline void AutoStep() {
                 // A run ending elsewhere means the draw numbering shifted;
                 // shift the verified band by the same amount.
                 const int shift = band_last - k->run_last;
+                band_shift = shift;
                 band_first = k->first + shift;
                 band_last = k->last + shift;
                 if (shift == 0)
@@ -578,6 +1104,7 @@ inline void AutoStep() {
     ArmCapture(band_first, band_last, true);
 }
 
+
 // Once per BeginScene pass, after weapongrip::OnFrame.
 inline void OnFrame() {
     drawn_this_pass = false;
@@ -614,6 +1141,7 @@ inline void OnFrame() {
         Finalize();
 
     AutoStep();
+    IkOnFrame();
 
 
     if (!cap_armed)
@@ -664,6 +1192,18 @@ inline D3DMATRIX UniformScale(float s) {
     return m;
 }
 
+// The replay's frame relative to the controller, without its scale: the
+// grip tuple of the weapon in hand (weapongrip::ActiveGripOffset), which
+// keeps the game's hand-on-weapon relation, then the hand-only trim
+// ([vr] hand_*).
+inline D3DMATRIX ReplayOffset() {
+    const D3DMATRIX trim_delta = weapongrip::GripOffsetMatrix(
+        vrmod::config.hand_pitch_deg, vrmod::config.hand_roll_deg,
+        vrmod::config.hand_yaw_deg, vrmod::config.hand_fwd_cm,
+        vrmod::config.hand_up_cm);
+    return vrmod::Multiply(weapongrip::ActiveGripOffset(), trim_delta);
+}
+
 // Both hands draw once per pass, just before the first 2D (RHW) draw
 // after the scene: the HUD always follows the scene and precedes the
 // radar's view change, so the eye views are still current and the whole
@@ -683,6 +1223,50 @@ inline bool Gated() {
     if (!gamecam::DrivesView())
         return true;
     return false;
+}
+
+// What a hand is drawn by this pass.
+enum class HandSource { IkTarget, Replay, BareGrip };
+
+inline const char* HandSourceName(HandSource s) {
+    return s == HandSource::IkTarget ? "IK target"
+           : s == HandSource::Replay ? "hand replay"
+                                     : "bare grip";
+}
+
+// The world frame a hand (0 = left, 1 = right) is drawn in this pass, for
+// things placed on it, and the mesh scale that applies to positions in
+// it (the frame itself is rigid):
+// - IK arms posing the game's hand: their grip-point target, grip tuple x
+//   controller (the hand is rigid to that bone), scale 1;
+// - the replay drawing (exactly when Gated() lets it): its own chain,
+//   ReplayOffset() x controller, scale hand_scale;
+// - neither: the grip tuple on the controller, scale 1.
+// All three include the active grip tuple, so a gun's tuple moves the
+// frame too. False with no controller pose in the world.
+inline bool DrawnHandFrame(int side, D3DMATRIX& frame, float& mesh_scale,
+                           HandSource& source) {
+    side &= 1;
+    if (ikarms::Active() && ikarms::arms[side].have_target) {
+        frame = ikarms::arms[side].target_world;
+        mesh_scale = 1.0f;
+        source = HandSource::IkTarget;
+        return true;
+    }
+    D3DMATRIX pose, hand_world;
+    if (!vrmod::Get()->GetHandPose(side, pose) ||
+        !gamecam::WorldFromTracking(pose, hand_world))
+        return false;
+    if (!Gated()) {
+        frame = vrmod::Multiply(ReplayOffset(), hand_world);
+        mesh_scale = vrmod::config.hand_scale;
+        source = HandSource::Replay;
+    } else {
+        frame = vrmod::Multiply(weapongrip::ActiveGripOffset(side), hand_world);
+        mesh_scale = 1.0f;
+        source = HandSource::BareGrip;
+    }
+    return true;
 }
 
 inline void MaybeDraw(IDirect3DDevice9* dev, bool scene_draw) {
@@ -729,17 +1313,10 @@ inline void DrawNow(IDirect3DDevice9* dev, const char* trigger) {
     if (!have[0] && !have[1])
         return;
 
-    // The hand rides the same grip tuple as the weapon in hand
-    // (weapongrip::ActiveGripOffset), which keeps the game's hand-on-weapon
-    // relation, plus the hand-only trim ([vr] hand_*).
-    const D3DMATRIX offset = weapongrip::ActiveGripOffset();
-    const D3DMATRIX trim_delta = weapongrip::GripOffsetMatrix(
-        vrmod::config.hand_pitch_deg, vrmod::config.hand_roll_deg,
-        vrmod::config.hand_yaw_deg, vrmod::config.hand_fwd_cm,
-        vrmod::config.hand_up_cm);
-    const D3DMATRIX scale = UniformScale(vrmod::config.hand_scale);
+    // The scale is uniform and outermost, so DrawnHandFrame can hand out
+    // the rigid frame and the scale apart.
     const D3DMATRIX local =
-        vrmod::Multiply(vrmod::Multiply(scale, offset), trim_delta);
+        vrmod::Multiply(UniformScale(vrmod::config.hand_scale), ReplayOffset());
 
     // Save the device state both passes touch.
     D3DMATRIX saved_world;

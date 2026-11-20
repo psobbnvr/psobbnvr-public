@@ -69,6 +69,7 @@
 #include <cstring>
 
 #include "MinHook.h"
+#include "psobbvr_armray.hpp"
 #include "psobbvr_gamecam.hpp"
 #include "psobbvr_log.hpp"
 #include "psobbvr_probe.hpp"
@@ -279,10 +280,9 @@ inline void OnFrame() {
 
     // The left hand's aim ray for tech banks.
     if (vrmod::config.target_aim & 4) {
-        D3DMATRIX pose, world;
-        if (vrmod::Get()->GetHandAimPose(0, pose) &&
-            gamecam::WorldFromTracking(pose, world)) {
-            tech_yaw_bams = YawFromDirection(-world._31, -world._33);
+        armray::Result arm;
+        if (armray::LeftAim(arm)) {
+            tech_yaw_bams = YawFromDirection(arm.dir[0], arm.dir[2]);
             tech_aim_valid = true;
         }
     }

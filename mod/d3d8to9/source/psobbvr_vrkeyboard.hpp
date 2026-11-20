@@ -143,6 +143,8 @@ inline int key_count = 0;
 inline bool layout_built = false;
 
 constexpr UINT PANEL_W = 1024, PANEL_H = 400;
+// The backend panel slot the keyboard draws in (on top of any other).
+constexpr int PANEL_SLOT = vrmod::VRInterface::kPanelKeyboard;
 constexpr int TEXT_LINE_H = 56;
 constexpr int ROW_H = 64;
 constexpr int PAD = 10;
@@ -551,7 +553,7 @@ inline void Close(const char* why) {
     shift = false;
     pending_head = pending_tail = 0;
     key_frames = 0;
-    vrmod::Get()->HidePanel();
+    vrmod::Get()->HidePanel(PANEL_SLOT);  // takes the rays with it
 }
 
 
@@ -677,8 +679,9 @@ inline void Drive(const vrmod::ControllerState& cs, AddFn& add) {
         dirty = false;
         Rasterize();
         if (dib_bits != nullptr)
-            vrmod::Get()->ShowPanel((const uint32_t*)dib_bits, PANEL_W, PANEL_H,
-                                    pose_m, vrmod::config.keyboard_width_m);
+            vrmod::Get()->ShowPanel(PANEL_SLOT, (const uint32_t*)dib_bits,
+                                    PANEL_W, PANEL_H, pose_m,
+                                    vrmod::config.keyboard_width_m);
     }
 }
 

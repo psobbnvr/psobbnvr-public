@@ -11,6 +11,7 @@ The mod aims to create a mostly vanilla PSO experience, while adding a few featu
 - Independent mechgun control (Mechguns can be aimed at different targets which halves the normal damage output, or at the same target for full damage)
 - Motion casting for techniques
 - Technique aiming for targeted techniques
+- Spell wheel: a ring of your techniques (or traps) at your hand, set up per character
 - On-screen keyboard
 
 **Status: beta.** Expect minor visual issues.  The alpha version was in play testing for a few weeks, so most of the major bugs have been worked out.  
@@ -140,6 +141,7 @@ game menu or dialog is showing.
 | A | quick chat | — |
 | Right grip + B | open the game menu | close it |
 | Y | item details / chat context (Tab) | — |
+| X (hold) | spell wheel: a ring of your techniques (traps on an android) opens at your right hand | — |
 | Right grip + X | open the chat line (the on-screen keyboard comes up with it) | — |
 | Right stick click | Enter | confirm |
 | Left stick click | Esc | Esc |
@@ -166,9 +168,18 @@ twin swords, and double sabers), **grey** = wait. A ring shrinks
 onto it as your next swing comes due.  You can turn it off in the
 Options program.
 
-**Techniques.** Your left hand aims (Foie, Barta, Rafoie, Gibarta, Gizonde and Megid)
+**Techniques.** Your left arm aims (Foie, Barta, Rafoie, Gibarta, Gizonde and Megid)
 and a swing with the right hand casts. Techniques you don't aim (Resta, Shifta,
 Deband, Zonde, Grants and the like) cast on a swing of either hand.
+
+**Spell wheel.** Hold X and a ring of eight segments opens at your right
+hand. Push the right stick toward a segment to light it, pull the right
+or left trigger to turn the pages, and let go of X to choose it; let go
+with the stick centred to clear the choice. A swing with no other button
+held then casts it, and its icon sits on the palm of your left hand.
+Each character has its own wheel and it starts empty: enter the world
+with the character once, then set it up on the Options program's Spell
+wheel page.
 
 Swinging is optional: untick "Swing to attack" or "Swing to cast" in the
 Options program and that action fires on the button press instead.
@@ -209,7 +220,7 @@ other chords in the Options program, for example `menu = left_menu`,
 ## Settings
 
 `psobbvr_options.exe` in the game folder is the Options program. It has
-three pages:
+four pages:
 
 - **Controller bindings:** one entry per action; type or pick a chord
   (`left_grip+x`, `menu`, `right_stick_click`, ...). **Check** explains
@@ -226,9 +237,15 @@ three pages:
 - **VR settings:** resolution per eye (lower it if the headset
   stutters), eye height, HUD position and height, HUD and menu distance and size,
   terrain and box draw distance, smooth or snap turning, turn speed, stick deadzone, hand and weapon
-  size, IK arms (experimental: your character's whole arms reach for
-  the controllers), weapon photon trail, the swing and casting options, vibration. Click a
+  size, IK arms (on by default; experimental: your character's whole arms reach for
+  the controllers, untick it to show the hands alone), weapon photon trail, the swing and casting options, vibration. Click a
   setting to read what it does.
+- **Spell wheel:** one wheel per character, up to eight pages of eight
+  segments. The page is greyed out until the game has listed your
+  characters: enter the world with one once. Pick a character, set each
+  page's segments, or press **Fill with what this class can learn** for
+  a starting layout. **Save**, and a running game picks it up within a
+  second.
 
 Game options and VR settings take effect the next time the game starts.
 Every setting, with a comment explaining it and its default value, is

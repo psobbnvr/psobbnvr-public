@@ -53,7 +53,8 @@ target_link_libraries(dinput8 PRIVATE minhook user32 dxguid)
 set_target_properties(dinput8 PROPERTIES OUTPUT_NAME "dinput8" PREFIX "")
 
 # PSOBB VR Options, the settings program: controller bindings, the game's
-# option.exe settings and the VR settings. Plain Win32, static CRT.
+# option.exe settings, the VR settings and the spell wheel. Plain Win32,
+# static CRT.
 add_executable(psobbvr_options WIN32 bindings_editor/main.cpp)
 target_include_directories(psobbvr_options PRIVATE d3d8to9/source src)
 target_link_libraries(psobbvr_options PRIVATE user32 gdi32 comctl32 comdlg32 shell32 advapi32)

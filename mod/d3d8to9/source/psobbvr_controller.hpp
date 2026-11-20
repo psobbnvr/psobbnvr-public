@@ -25,6 +25,8 @@
 //   right trigger     bottom palette slot / Confirm in menus
 //   left trigger      left palette slot / Back in menus
 //   both triggers     right palette slot
+// While the spell wheel is open (psobbvr_wheel_input.hpp) the right stick
+// picks its segment and the triggers turn its pages instead.
 //
 // With a melee weapon the regular attack (right trigger) arms its palette
 // key and the physical swing fires it (SwingDetect). Heavy and special
@@ -43,6 +45,7 @@
 #include "psobbvr_vr.hpp"
 #include "psobbvr_vrkeyboard.hpp"
 #include "psobbvr_weapongrip.hpp"
+#include "psobbvr_wheel_input.hpp"
 
 namespace controller {
 
@@ -275,6 +278,13 @@ inline BYTE sw_armed_key = 0;    // this frame's armed palette key; 0 = none
 // Used while our charged heavy/special runs - its release and the row
 // hold's strikes wait on the stamp.
 constexpr BYTE SW_KEY_STAMP = 0xFF;
+// Spell wheel arming: also stamp-only, but the fire posts the wheel's fire
+// request (wheelinput::PostSwingFire) instead of pressing a key. Armed
+// only on a bare swing: nothing of the player's held or in flight.
+constexpr BYTE SW_KEY_WHEEL = 0xFE;
+inline bool sw_wheel_right = true;         // with SW_KEY_WHEEL: the right
+                                           // hand's swing fires it too
+inline LONGLONG wheel_seen_fire_qpc = 0;   // the last stamp that posted
 inline bool sw_armed_melee = false;  // a melee chord, not a tech (the
                                      // left hand fires these with a twin
                                      // weapon)
@@ -378,7 +388,9 @@ inline void SwingDetectHand(int hand) {
                 sw_fire_frames = 4;  // ~2 game ticks held
                 diag::Log("swingattack: FIRE key 0x%02X at %.2f m/s (%s)%s",
                           sw_fire_key, h.speed, hn,
-                          sw_fire_key == SW_KEY_STAMP ? " (stamp only)" : "");
+                          sw_fire_key == SW_KEY_STAMP   ? " (stamp only)"
+                          : sw_fire_key == SW_KEY_WHEEL ? " (spell wheel)"
+                                                        : "");
                 if (sw_fire_key == K_DOWN)  // a normal attack: decide
                     gunfire::MeleeSnapFire();  // the facing snap
             }
@@ -390,10 +402,14 @@ inline void SwingDetectHand(int hand) {
     }
 }
 inline void SwingDetect(bool left_active) {
-    SwingDetectHand(1);
+    // [wheel] swing_hand = left: the right hand never fires the wheel.
+    if (sw_armed_key == SW_KEY_WHEEL && !sw_wheel_right)
+        sw_hand[1].above = 0;
+    else
+        SwingDetectHand(1);
     // The left hand fires melee chords with a twin weapon, and techniques
     // it does not aim (an aimed one, e.g. Foie, is cast by the right hand
-    // while the left points it).
+    // while the left points it); for the wheel, also its traps.
     if ((left_active && sw_armed_melee) || sw_armed_tech_left)
         SwingDetectHand(0);
     else
@@ -1316,6 +1332,15 @@ inline bool HotkeyPress(int action, unsigned char key) {
     return true;
 }
 
+// Is any hotkey chord held (its button down since the press that picked
+// it), armed or pressed through? A bare grip is not a chord.
+inline bool AnyHotkeyHeld() {
+    for (int a = 0; a < bindcore::kActionCount; a++)
+        if (bindcore::IsHotkey(a) && bindings::ActionHeld(a))
+            return true;
+    return false;
+}
+
 // Does this arrow's palette action arm for the swing rather than press
 // through? Attacks (type 2) arm under allow_attack, techs (3/5) under
 // allow_tech (any weapon). Context actions, items and empty slots press
@@ -1400,6 +1425,11 @@ inline void OnFrame(bool gameplay_drives) {
     vrmod::ControllerState cs;
     const bool have =
         vrmod::config.controllers && vrmod::Get()->GetControllerState(cs);
+    // The binding table and the [wheel] settings: the first load, then the
+    // psobbvr.ini poll. Ahead of the neutral path below, so they load and
+    // reload without controller input too (no controllers, the headset
+    // off, the SteamVR dashboard up, the on-screen keyboard open).
+    bindings::Poll();
     // On-screen keyboard (psobbvr_vrkeyboard.hpp): detect a text field
     // every frame; while its panel is up the controller belongs to it.
     vrkeyboard::Tick();
@@ -1415,8 +1445,14 @@ inline void OnFrame(bool gameplay_drives) {
             movement::stick_raw_turn = 0.0f;
         bindings::Reset();
         hk_armed_key = 0;
-        prev_rtrig = prev_ltrig = false;
-        rtrig_dropped = ltrig_dropped = false;
+        wheelinput::Cancel(kbd_modal ? "the on-screen keyboard took the controllers"
+                                     : "no controller input");
+        // A trigger still held when the keyboard closes (its Enter closed
+        // the field) stays silent until released: read as a fresh pull it
+        // would confirm again in a menu and reopen the field.
+        prev_rtrig = prev_ltrig = kbd_modal;
+        rtrig_menu = ltrig_menu = false;
+        rtrig_dropped = ltrig_dropped = kbd_modal;
         prev_rt_field = prev_lt_field = false;
         rt_spent = lt_spent = false;
         trig_active = 0;
@@ -1495,12 +1531,6 @@ inline void OnFrame(bool gameplay_drives) {
     // whenever cast arming could apply. Independent of swing_attack.
     const bool cast_swing_mode = vrmod::config.cast_swing &&
                                  gameplay_drives && !combat_free && !sw_dead;
-    SwingSample(1, cs, swing_mode || cast_swing_mode);
-    // The left hand samples with a twin weapon, and under cast arming
-    // when it may cast (sw_armed_tech_left).
-    const bool left_mode = swing_mode && LeftSwingActive();
-    const bool left_cast_mode = cast_swing_mode && vrmod::config.cast_left_hand;
-    SwingSample(0, cs, left_mode || left_cast_mode);
 
     // Menu mode = a non-gameplay screen, the game's UI focus, a modal
     // prompt, or the shrunken-viewport latch (a fallback for moments the
@@ -1509,6 +1539,34 @@ inline void OnFrame(bool gameplay_drives) {
         !gameplay_drives || GameUiFocused() || GameModalPrompt() ||
         stereo::menu_viewport_active;
     diag::ui_focused = menu_mode;  // the menu-routing trace counts these frames
+
+    // The spell wheel's choice fires on a bare swing (armed below), only
+    // while the game would take it (wheel::ChoiceCastableNow: learned, TP,
+    // not a town or lobby; a trap left). A swing the game would refuse
+    // arms nothing, so it leaves no stamp for the swing indicator's ring.
+    // The right hand fires any choice; the left fires traps and the
+    // techniques it may cast (TechLeftCasts: cast_left_hand, and not one
+    // its ray aims). [wheel] swing_hand narrows both.
+    const bool wheel_swing_mode = wheelconfig::config.enabled && wheel::Armed() &&
+                                  gameplay_drives && !sw_dead && !menu_mode &&
+                                  wheel::ChoiceCastableNow();
+    const wheelcore::Entry wheel_choice = wheel::Choice();
+    const bool wheel_left_may_fire =
+        wheel_swing_mode && wheelconfig::config.swing_hand != wheelconfig::SWING_RIGHT &&
+        (wheel_choice.kind == wheelcore::Kind::Trap ||
+         (wheel_choice.kind == wheelcore::Kind::Technique &&
+          TechLeftCasts((BYTE)wheel::TYPE_TECHNIQUE, (BYTE)wheel_choice.index)));
+    const bool wheel_right_may_fire =
+        wheelconfig::config.swing_hand != wheelconfig::SWING_LEFT;
+
+    SwingSample(1, cs, swing_mode || cast_swing_mode || wheel_swing_mode);
+    // The left hand samples with a twin weapon, and under cast arming
+    // when it may cast (sw_armed_tech_left).
+    const bool left_mode = swing_mode && LeftSwingActive();
+    const bool left_cast_mode = cast_swing_mode && vrmod::config.cast_left_hand;
+    SwingSample(0, cs, left_mode || left_cast_mode ||
+                           (wheel_swing_mode && wheel_left_may_fire));
+
     const float press = vrmod::config.controller_press;
     const float dz = vrmod::config.controller_deadzone;
     const float side_sign = vrmod::config.controller_side_sign < 0 ? -1.0f : 1.0f;
@@ -1523,7 +1581,6 @@ inline void OnFrame(bool gameplay_drives) {
     // Buttons, grips, stick clicks and right-stick flicks go through the
     // binding table. Runs before the triggers so the palette guard knows
     // this frame's Ctrl hold.
-    bindings::Poll();
     bindings::hotkey_press = &HotkeyPress;
     hk_swing_mode = swing_mode;
     hk_cast_mode = cast_swing_mode;
@@ -1544,11 +1601,19 @@ inline void OnFrame(bool gameplay_drives) {
         held_mods = (now[bindcore::BTN_LEFT_GRIP] ? bindcore::MOD_LEFT_GRIP : 0u) |
                     (now[bindcore::BTN_RIGHT_GRIP] ? bindcore::MOD_RIGHT_GRIP : 0u);
         // In a menu the stick navigates, unless a flick chord's grip is
-        // held: then it picks hotkeys as in the field.
+        // held: then it picks hotkeys as in the field. While the spell
+        // wheel owns the stick it flicks nothing (a grip squeezed during
+        // the wheel must not fire hotkeys 5-8).
         bindings::StickFlick(cs.stick_x[1], cs.stick_y[1],
-                             !menu_mode || bindings::StickIsSelector(held_mods), now);
+                             (!menu_mode || bindings::StickIsSelector(held_mods)) &&
+                                 !wheelinput::OwnsStick(),
+                             now);
         bindings::Evaluate(now, held_mods, menu_mode, add);
     }
+    // The spell wheel: its hold, pick and pages. After the bindings (it
+    // reads their hold state), before the triggers and sticks (which ask
+    // whether it is open).
+    wheelinput::Tick(cs, menu_mode, gameplay_drives);
 
     // Triggers: see the comment at TRIG_CHORD_SETTLE.
     const bool rtrig_now = cs.trigger[1] > press;
@@ -1574,6 +1639,16 @@ inline void OnFrame(bool gameplay_drives) {
     else if (!ltrig_menu && menu_mode && !ltrig_dropped) {
         ltrig_dropped = true;
         diag::Log("trigger: left field hold silenced (a menu took focus)");
+    }
+    // While the spell wheel is open the triggers turn its pages and never
+    // reach the palette; one still held when it closes stays silent until
+    // released (the rule above). A trigger hold that was arming an attack
+    // when the wheel opened is disarmed by this.
+    if (wheelinput::Open()) {
+        if (rtrig_now)
+            rtrig_dropped = true;
+        if (ltrig_now)
+            ltrig_dropped = true;
     }
     const bool rt_field = rtrig_now && !rtrig_menu && !rtrig_dropped;
     const bool lt_field = ltrig_now && !ltrig_menu && !ltrig_dropped;
@@ -1711,6 +1786,64 @@ inline void OnFrame(bool gameplay_drives) {
         sw_armed_key = SW_KEY_STAMP;
         sw_armed_melee = true;
     }
+    // The spell wheel's bare swing: with a choice armed and nothing of the
+    // player's held or in flight, a swing posts the wheel's fire request
+    // and presses no key. Anything held keeps doing what it does: a trigger
+    // (raw, so a silenced or still-settling hold counts too), a hotkey
+    // chord (armed or pressed through), the wheel's own button; a grip held
+    // on its own does not count. In flight: the last swing's
+    // synthesized press and its released gap (the attack it pressed has
+    // not started yet, and SwingWarp claims that attack by the K_DOWN
+    // stamp), a heavy or special in its charge stages (ch_was_charging,
+    // ours or not: the game is in an attack and serves no cast until it
+    // ends, and our released charge still runs out its countdown), and our
+    // swing-paced attack through its stage 3 and holds (wp_ours_paced: a
+    // row hold waits for the next swing, which must stay the attack's).
+    {
+        static const char* const kWheelNotCastable =
+            "the choice cannot be cast now (not learned, no TP, or a town)";
+        const char* block = nullptr;
+        if (!wheel_swing_mode)
+            block = !wheelconfig::config.enabled ? "[wheel] enabled is 0"
+                  : !wheel::Armed()              ? "nothing chosen"
+                  : sw_dead                      ? "the player is down"
+                  : !gameplay_drives             ? "the camera takeover is off"
+                  : menu_mode                    ? "a menu has focus"
+                                                 : kWheelNotCastable;
+        // Asked again (cached unless it changed): a release in this call
+        // may have armed a new choice or cleared it.
+        else if (!wheel::Armed())
+            block = "nothing chosen";
+        else if (!wheel::ChoiceCastableNow())
+            block = kWheelNotCastable;
+        else if (!wheel_left_may_fire && !wheel_right_may_fire)
+            block = "no hand may fire this choice ([wheel] swing_hand left, an aimed technique)";
+        else if (sw_armed_key != 0)
+            block = "a palette action is armed";
+        else if (rtrig_now || ltrig_now)
+            block = "a trigger is held";
+        else if (hk_armed_key != 0)
+            block = "a hotkey is armed";
+        else if (AnyHotkeyHeld())
+            block = "a hotkey chord is held";
+        else if (wheelinput::ButtonHeld() || wheelinput::Open())
+            block = "the wheel's button is held";
+        else if (sw_fire_frames > 0 || sw_gap_frames > 0)
+            block = "the last swing's press is in flight";
+        else if (ch_was_charging)
+            block = "a heavy or special attack is charging";
+        else if (wp_ours_paced)
+            block = "a swing-paced attack is running";
+        if (block == nullptr) {
+            sw_armed_key = SW_KEY_WHEEL;
+            sw_armed_melee = false;
+            sw_armed_tech_left = wheel_left_may_fire;
+            sw_wheel_right = wheel_right_may_fire;
+        }
+        wheelinput::swing.eligible = wheel_swing_mode;
+        wheelinput::swing.armed = block == nullptr;
+        wheelinput::swing.blocked = block;
+    }
     // Swing detection and the synthesized press. A menu opening or the
     // takeover stopping drops the press (palette keys navigate menus).
     SwingDetect(left_mode);
@@ -1720,6 +1853,10 @@ inline void OnFrame(bool gameplay_drives) {
         hk_fired_key = hk_armed_key;
         hk_fired_tick = GameTicks();
         hk_armed_key = 0;
+    }
+    if (sw_fire_key == SW_KEY_WHEEL && sw_fire_qpc != wheel_seen_fire_qpc) {
+        wheel_seen_fire_qpc = sw_fire_qpc;  // the bare swing fired the wheel
+        wheelinput::PostSwingFire(sw_fire_hand);
     }
     if (menu_mode || !gameplay_drives)
         sw_fire_frames = 0;
@@ -1733,7 +1870,7 @@ inline void OnFrame(bool gameplay_drives) {
     }
     if (sw_fire_frames > 0) {
         sw_fire_frames--;
-        if (sw_fire_key != SW_KEY_STAMP)
+        if (sw_fire_key != SW_KEY_STAMP && sw_fire_key != SW_KEY_WHEEL)
             add(sw_fire_key);
         if (sw_fire_key == K_LEFT || sw_fire_key == K_RIGHT)
             chord_press_qpc = tq.QuadPart;  // ChargeHold's "ours" stamp
@@ -1752,21 +1889,24 @@ inline void OnFrame(bool gameplay_drives) {
 
     // Sticks. The left stick always walks. The right stick turns in the
     // field, but not while a menu owns it (Left/Right Arrow there; Up/Down
-    // on the dominant axis past a firm threshold) or while a hotkey-flick
-    // grip is held (psobbvr_bindings.hpp) - in a menu that grip, or a
-    // flick not yet re-centered, also stops the arrows.
+    // on the dominant axis past a firm threshold), while a hotkey-flick
+    // grip is held (psobbvr_bindings.hpp) or while the spell wheel owns it
+    // (open, or not yet re-centred after it closed) - in a menu that grip,
+    // a flick not yet re-centered or the wheel's push also stops the
+    // arrows.
     const float lx = DeadzoneCurve(cs.stick_x[0], dz);
     const float ly = DeadzoneCurve(cs.stick_y[0], dz);
     // With the Quick Menu up (our own latch), X stays the turn; its
     // chord pressed again cycles the tabs. Y is still Up/Down.
     const bool quick_menu = menu_mode && bindings::quick_menu_open;
     const bool turn_ok = (!menu_mode || quick_menu) &&
-                         !bindings::StickIsSelector(held_mods);
+                         !bindings::StickIsSelector(held_mods) &&
+                         !wheelinput::OwnsStick();
     const float rx = turn_ok ? DeadzoneCurve(cs.stick_x[1], dz) : 0.0f;
     const float rxr = cs.stick_x[1];
     const float ry = cs.stick_y[1];
     if (menu_mode && !bindings::StickIsSelector(held_mods) &&
-        !bindings::FlickOwnsStick()) {
+        !bindings::FlickOwnsStick() && !wheelinput::OwnsStick()) {
         if (fabsf(ry) >= 0.6f && fabsf(ry) > fabsf(rxr))
             add(ry > 0 ? K_UP : K_DOWN);
         else if (!quick_menu && fabsf(rxr) >= 0.6f && fabsf(rxr) > fabsf(ry))

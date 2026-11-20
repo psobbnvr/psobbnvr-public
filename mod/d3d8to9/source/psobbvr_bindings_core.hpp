@@ -164,6 +164,11 @@ constexpr ActionDef kActions[] = {
      "Menus only: Up Arrow"},
     {"nav_down", {K_DOWN, 0}, 1, MODE_HOLD, SCOPE_MENU, "",
      "Menus only: Down Arrow"},
+    // A hold with no keys: the spell wheel reads it with ActionHeld
+    // (psobbvr_wheel_input.hpp). Bare X: left_grip+x (hotkey 3) and
+    // right_grip+x (chat) still win while their grip is held.
+    {"wheel", {0, 0}, 0, MODE_HOLD, SCOPE_FIELD, "x",
+     "Hold: spell wheel (right stick picks, triggers page, release chooses)"},
 };
 constexpr int kActionCount = sizeof(kActions) / sizeof(kActions[0]);
 constexpr int kBank2Action = 4;  // index of "bank2" above

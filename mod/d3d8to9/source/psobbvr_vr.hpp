@@ -89,6 +89,9 @@ struct Config {
     bool keyboard_force_show = false;
     char type_text_request[128] = {};
     char type_key_request[16] = {};
+    // Developer-build request consumed by wheeldraw::Update: the spell
+    // wheel's ring up without its button (the local class's first page).
+    bool wheel_force_show = false;
     // Menu world-lock: on non-gameplay frames, pin the 2D content to a
     // world-anchored screen so reprojection smooths look-around to display
     // rate (head-locked content updates at 30 Hz). Layers: opaque
@@ -292,6 +295,9 @@ struct Config {
     // Speed multiplier while walking backwards (the base speed float at
     // entity+0x6B8, saved and restored).
     float back_speed_scale = 0.85f;
+    // Touching a body undoes a move toward it judged by the move's own
+    // direction, not the character's facing (psobbvr_movement.hpp).
+    bool contact_by_move = true;
     // Turn-key-only input turns in place instead of running 90 degrees to
     // the side (psobbvr_movement.hpp).
     bool side_turn = true;
@@ -471,9 +477,25 @@ struct Config {
     bool cast_left_hand = true;
     // Cast facing chase: the tech tick machine 0x6A00AC turns the
     // character toward the target every tick (the same 0x7A8CB8 chase as
-    // melee). 0 = suppressed for our casts (cosmetic: the target comes
-    // from the pair array / aim point). 1 = vanilla.
+    // melee). 0 = suppressed for our casts (cosmetic: a locked cast flies
+    // to its attack pair's target). 1 = vanilla.
     bool cast_facing_snap = false;
+    // Unlocked aimed casts (Foie, Barta, Gibarta, Megid) fly along the
+    // left controller's aim ray, pitch included, instead of the
+    // character's facing (psobbvr_techcast.hpp). 0 = vanilla.
+    bool cast_aim_point = true;
+    // How far along that ray the aim point sits, game units; the point
+    // only sets the flight direction.
+    float cast_aim_point_dist = 100.0f;
+    // What the left hand's technique aim follows (psobbvr_armray.hpp):
+    // 1 = the line from an estimated left shoulder through the hand, 0 = the
+    // controller's pointing direction.
+    int cast_aim_ray = 1;
+    // The estimated shoulder relative to the head, metres: below it, to its
+    // left and behind it (head yaw only).
+    float cast_aim_shoulder_down_m = 0.23f;
+    float cast_aim_shoulder_side_m = 0.08f;
+    float cast_aim_shoulder_back_m = 0.08f;
     // Yaw cone half-angle for single-target directional techs (Foie,
     // Barta, Megid) steered by the left ray, applied only when tighter
     // than the game's (Foie 30, Barta 50, Megid 40).
@@ -639,14 +661,82 @@ struct Config {
     // kept on any fast swing. 0 = the local weapon's trails are hidden
     // (the game builds them along the hidden arm).
     bool weapon_trail = true;
-    // Blade speed in room space (m/s) that starts a trail; it stops below
-    // half of it.
+    // Blade speed (m/s) that starts a trail; it stops below half of it.
     float weapon_trail_speed = 2.0f;
+    // The speed is the blade's through the world, so the character's own
+    // walking, running and turning count. 0 = the speed in room space
+    // (only the hand's motion counts).
+    bool weapon_trail_moving = true;
+    // The trail is sampled through the game's blend from one animation
+    // clip into the next (about 5 ticks after every change of action). 0 =
+    // not sampled then, as the game has it: the trail has a gap there.
+    bool weapon_trail_blend = true;
     float grip_pitch_deg = 0.0f;
     float grip_roll_deg = 180.0f;
     float grip_yaw_deg = 0.0f;
     float grip_fwd_cm = -3.0f;
     float grip_up_cm = 0.0f;
+    // Melee weapon slid along its own blade relative to the hand, cm,
+    // positive = toward the tip, added to its kind's own slide
+    // (weapongrip::kMeleeSlideKindDefaultCm). The hand does not move.
+    float melee_slide_cm = 0.0f;
+    // Melee weapon shift out through the palm, cm, added to its kind's own
+    // (weapongrip::kMeleeSideKindDefaultCm) and the class trim.
+    float melee_side_cm = 0.0f;
+    // Melee weapon tilt about the axis through the palm, degrees, added to
+    // its kind's own (weapongrip::kMeleePitchKindDefaultDeg).
+    float melee_pitch_deg = 0.0f;
+    // How much of the change in the fist's angle with the character's
+    // build the melee weapon follows, 0..1: 1 = all of it, 0 = the default
+    // build's angle on every build.
+    float melee_angle_follow = 0.5f;
+    // The melee weapon on the controller's line (IK arms on,
+    // weapongrip::MeleeLineSeat): 1 = the weapon is drawn on the reference
+    // hand's seat on every character and the hand is moved onto it; 0 = the
+    // hand stays on the controller's grip frame and the weapon follows the
+    // character's own fist.
+    int melee_hand_seat = 1;
+    // A held gun placed from the hand (IK arms on, gun_seat 1,
+    // weapongrip::GunFrameOffset): 1 = the hand stays where it holds a melee
+    // weapon and the gun is drawn where its seat in that hand puts it, so the
+    // hand does not move between a melee weapon and a gun, and a hand holding
+    // no part of the gun is on the bare hand's frame; the gun_* grip tuple is
+    // then not used. 0 = the gun on its grip tuple, the hand moved onto it.
+    int gun_to_hand = 1;
+    // With gun_to_hand: a turn of the gun and its hand about the axis through
+    // the palm at the grip point, degrees, barrel up positive.
+    float gun_hand_pitch_deg = 0.0f;
+    // An empty hand (IK arms on, melee_hand_seat 1, weapongrip::
+    // EmptyHandOffset): 1 = where it holds a weapon, so it does not turn when
+    // one is equipped or put away; 0 = on the bare hand's frame.
+    int bare_hand_on_line = 1;
+    // Closing the character's fist around the held weapon (IK arms on):
+    // 0/1, and the shaping amounts in cm.
+    int hand_close = 1;
+    float hand_close_gap_cm = 1.0f;
+    float hand_close_reach_cm = 4.0f;
+    float hand_close_cap_cm = 2.0f;
+    float hand_close_fade_cm = 3.0f;
+    // Fitting the hand to the held weapon in place of the fist closing (IK
+    // arms on, psobbvr_handfit.hpp): 0/1. Where no finger angle (no thumb
+    // slide) clears the weapon: 1 = the fingers (thumb) stay as the game has
+    // them, 0 = the least bad angle (slide), taken only among the angles
+    // (slides) up to the limit share (0..1) of the most they may open (slide);
+    // the limits are doubles so a typed value is kept exactly.
+    int hand_fit = 1;
+    int hand_fit_fingers_unclear = 0;
+    double hand_fit_fingers_unclear_limit = 0.5;
+    // 1 = the index block and the outer block each close to the least angle
+    // that clears the weapon for it alone; 0 = both take the one angle the
+    // block needing more takes.
+    int hand_fit_fingers_each = 1;
+    int hand_fit_thumb_unclear = 0;
+    double hand_fit_thumb_unclear_limit = 1.0;
+    // The gun seat (IK arms on, psobbvr_gunseat_core.hpp): 1 = the hand is
+    // moved onto the held gun so the gun sits in it along the gun's handle,
+    // the gun and its aim left where they are; 0 = the hand stays on the
+    // controller's grip frame.
+    int gun_seat = 1;
     float gun_pitch_deg = 40.0f;
     float gun_roll_deg = 180.0f;
     float gun_yaw_deg = 0.0f;
@@ -700,7 +790,7 @@ struct Config {
     // IK arms (psobbvr_ikarms.hpp): the character's own arms reach the
     // controllers. 0 off, 1 on, 2 a fixed test pose. While on, the arm hide
     // and the drawn hands stand down.
-    int ik_arms = 0;
+    int ik_arms = 1;
     // The elbow's pole direction in the character's frame, mirrored per
     // arm: out to the side, down, and back.
     float ik_pole_out = 0.4f;
@@ -719,6 +809,13 @@ struct Config {
     // animates, so the arms follow only the controllers. 0 off, 1 held on
     // the body, 2 also moved with the headset.
     int ik_anchor = 2;
+    // With ik_anchor: what happens to the recorded idle pose while the
+    // character stands idle. 0 = it is recorded again on every idle walk, so
+    // the idle animation and each weapon's stance show in the shoulders and
+    // wrists; 1 = once recorded it is held, and recorded again once when the
+    // idle clip is another one (another weapon type's stance); 2 = once
+    // recorded it is held until the character changes.
+    int ik_idle_hold = 2;
     // ik_anchor 2: the neck point the shoulders follow, below and behind
     // the tracked head (centimeters, head frame), so turning or tipping
     // the head about the neck leaves the shoulders still.
@@ -727,6 +824,17 @@ struct Config {
     // How much of the hand's roll the forearm takes (0..1); the wrist
     // takes the rest.
     float ik_twist = 0.65f;
+    // 1 = the elbow turns about the shoulder-to-wrist line with the hand's
+    // roll: past ik_elbow_dead_deg either way of ik_elbow_center_deg (the
+    // roll taken as the wrist's middle, mirrored for the left arm) it
+    // follows by ik_elbow_gain of the rest, up to ik_elbow_max_deg, eased
+    // at ik_elbow_rate_dps.
+    int ik_elbow = 1;
+    float ik_elbow_gain = 0.45f;
+    float ik_elbow_dead_deg = 20.0f;
+    float ik_elbow_max_deg = 70.0f;
+    float ik_elbow_center_deg = 30.0f;
+    float ik_elbow_rate_dps = 360.0f;
     // The player's reach (shoulder to the middle of the fist, arm
     // straight): the arms are lengthened or shortened so they straighten
     // with the player's. ik_arm_match blends from the character's own arm
@@ -735,10 +843,29 @@ struct Config {
     float ik_reach_cm = 68.0f;
     float ik_arm_match = 1.0f;
     float ik_stretch_max = 0.1f;
+    // Torso twist: the upper body turns toward the player's real torso,
+    // estimated from the head and hands, so the shoulders stay with the
+    // hands when the character's body faces another way from the player.
+    // ik_torso 0 off, 1 on. max_deg limits the twist; neck_deg is how far
+    // the head can turn from the torso (past it the torso is taken to have
+    // turned); smooth_s is the estimate's follow time; hands weights the
+    // hands-in-front cue (0 ignores it), seen from near_m to far_m ahead of
+    // the neck point, which sits neck_back_m behind the head; rate_dps
+    // limits how fast the applied twist changes.
+    int ik_torso = 1;
+    float ik_torso_max_deg = 80.0f;
+    float ik_torso_neck_deg = 60.0f;
+    float ik_torso_smooth_s = 0.30f;
+    float ik_torso_hands = 1.0f;
+    float ik_torso_hands_near_m = 0.10f;
+    float ik_torso_hands_far_m = 0.25f;
+    float ik_torso_neck_back_m = 0.10f;
+    float ik_torso_rate_dps = 360.0f;
     // Developer-build one-shots: log this many posed walks; log the
-    // status line.
+    // status line; log the torso estimate.
     int ik_trace_request = 0;
     bool ik_status_request = false;
+    bool ik_torso_status_request = false;
 };
 
 inline Config config;
@@ -966,18 +1093,43 @@ public:
                               int /*selected*/) {}
     virtual void HideMenuText() {}
 
-    // On-screen keyboard panel (psobbvr_vrkeyboard.hpp): a BGRA image
-    // (straight alpha, top-down rows) as a quad at `pose_m` in seated
-    // tracking space (row-vector rigid transform in meters; +z faces the
-    // viewer), `width_m` wide. Calling again re-uploads and moves it; up
-    // until HidePanel.
-    virtual void ShowPanel(const unsigned int* /*bgra*/, UINT /*width*/,
-                           UINT /*height*/, const D3DMATRIX& /*pose_m*/,
-                           float /*width_m*/) {}
-    virtual void HidePanel() {}
+    // ---- Panels -----------------------------------------------------------
+    // Caller-rasterized images composited over everything (the world, the
+    // HUD and the other overlays), one per numbered slot. Each slot has its
+    // own image, size, pose and visibility. Where two are up at once the
+    // lower slot number draws on top, so the keyboard wins.
+    static constexpr int kPanelKeyboard = 0;  // on-screen keyboard (psobbvr_vrkeyboard.hpp)
+    static constexpr int kPanelWheel = 1;     // the spell wheel's ring
+    static constexpr int kPanelSlots = 2;
+
+    // Show a slot: a BGRA image (straight alpha, top-down rows) as a quad
+    // at `pose_m` in seated tracking space (row-vector rigid transform in
+    // meters; +z faces the viewer), `width_m` wide, its height from the
+    // image's aspect. Calling again re-uploads and moves it; up until
+    // HidePanel. Out-of-range slots are ignored.
+    virtual void ShowPanel(int /*slot*/, const unsigned int* /*bgra*/,
+                           UINT /*width*/, UINT /*height*/,
+                           const D3DMATRIX& /*pose_m*/, float /*width_m*/) {}
+    // Hide one slot. Hiding kPanelKeyboard also hides both hand rays
+    // (they are the keyboard's); hiding any other slot leaves them alone.
+    virtual void HidePanel(int /*slot*/) {}
+    // Move a slot without re-uploading its image (`pose_m` as for
+    // ShowPanel). Visibility is unchanged: a hidden slot stays hidden, and
+    // the next ShowPanel sets its own pose.
+    virtual void SetPanelPose(int /*slot*/, const D3DMATRIX& /*pose_m*/) {}
+    // The space a slot's pose is given in: -1 = seated tracking space (the
+    // default), 0 / 1 = that hand's grip pose, so the compositor carries
+    // the quad with the controller at display rate. Poses passed to
+    // ShowPanel / SetPanelPose for the slot are then relative to that grip
+    // (row-vector, meters). Kept until changed.
+    virtual void SetPanelSpace(int /*slot*/, int /*hand*/) {}
+    // True while a slot is up (shown and not hidden since). False on
+    // backends without panels.
+    virtual bool PanelVisible(int /*slot*/) const { return false; }
     // The keyboard's hand rays: a thin beam quad per hand (`pose_m` as for
     // ShowPanel; y runs along the beam with the image's top row at the
-    // hand), drawn only while the panel is up. `visible` false hides it.
+    // hand), drawn on top of the panels, only while the kPanelKeyboard
+    // slot is up. `visible` false hides it.
     virtual void SetPanelRay(int /*hand*/, bool /*visible*/,
                              const D3DMATRIX& /*pose_m*/, float /*length_m*/,
                              float /*width_m*/) {}

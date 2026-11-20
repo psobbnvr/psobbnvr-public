@@ -2,9 +2,21 @@
 
 Tester-facing notes per release. Newest first.
 
+## 0.6.0-beta (2026-11-20)
+
+- IK Arms enabled by default.
+- Improved shoulder and elbow movement for IK arms.
+- Implemented weapon fitment system - Mod calculates the best placement for a weapon in the character's hand, accounting for different proportions and class models. Fingers and thumb move towards grip or out of grip if overlapping.
+- Added a spell wheel: hold X for a ring of your techniques (traps on an android) at your right hand; the right stick picks, the triggers page, let go to choose. A bare swing casts the choice and its icon sits on the palm of your left hand. Each of your characters has its own wheel: enter the world with a character once, then set up its pages in psobbvr_options.exe > Spell wheel (every character starts empty; "Fill with what this class can learn" gives a starting layout).
+- Untargeted Foie, Barta, Gibarta, and Megid go where the left arm is aiming.
+- Changed technique aiming to use average angle of the entire arm rather than just the hand.
+- Fixed an issue where walking backwards into NPCs and enemies would result in the player getting stuck.
+- Fixed the on-screen keyboard reopening when the trigger is held on Enter.
+- Improved weapon photon trails so that they appear with character movement.
+
 ## 0.5.1-beta (2026-10-14)
 
-- Improved head culling method.
+- Improved head culling method. Fixed an issue where head was sometimes visible after spawn.
 - Eye height now set immediately at spawn - no jump in height after the first lobby spawn.
 - IK arms (experimental): improved arm placement, sizing, and handling of different character heights.
 

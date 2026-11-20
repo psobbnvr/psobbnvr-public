@@ -20,12 +20,14 @@
 // head-trim suppression and body culling (ExemptingDraws()).
 //
 // Two-handed weapons: (1) the composite held-model draw 0x5E84A8 draws
-// one half per call for twin swords and mechguns; halves alternate
-// main/off, so odd composite brackets go to the left grip. (2) Funnel
-// duals (daggers, knuckles) draw both halves in one bracket; the off-hand
-// tail is found by its parts drifting against the root (same-hand parts
-// hold within +-0.002 units) and goes to the left grip. Both only for
-// two-handed kinds ([vr] twin_split).
+// one half per call for twin swords and mechguns; a half drawn on a
+// left-arm bone goes to the left grip. (2) Funnel
+// duals (daggers, knuckles) draw both halves in one bracket, and the
+// off-hand tail goes to the left grip. On the held draw's two-pass path
+// the tail begins at the game's second 0x5E84A8 call (bone 35); otherwise
+// it is found by its parts drifting against the root (same-hand parts
+// hold within +-0.002 units). Both only for two-handed kinds ([vr]
+// twin_split).
 //
 // [vr] weapon_grip, weapon_scale (uniform scale about the grip, re-seated
 // draws only).
@@ -33,12 +35,16 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include "MinHook.h"
+#include "psobbvr_eyeheight.hpp"
 #include "psobbvr_gamecam.hpp"
+#include "psobbvr_gunseat_core.hpp"
 #include "psobbvr_log.hpp"
 #include "psobbvr_probe.hpp"
 #include "psobbvr_vr.hpp"
+#include "psobbvr_weaponsnap.hpp"
 
 namespace weapongrip {
 
@@ -199,7 +205,7 @@ inline bool IsKnownFiringOverride(uintptr_t ov) {
 // The sampled points come from the game's arm animation, which the
 // re-seat replaces, so the add hook moves them with the transform the
 // last re-seated part got, and keeps a sample only while the blade moves
-// fast in room space. To sample outside attacks as well, the owner's
+// fast (TrailFast). To sample outside attacks as well, the owner's
 // action mask carries an attack bit while the sample sites run; the
 // model draw and everything after see the real value. A weapon whose
 // shape follows the attack state (PairReshapes) never gets it: its trail
@@ -216,6 +222,15 @@ constexpr uintptr_t WEAPON_OWNER_OFFSET = 0xF8;          // the owner entity
 constexpr uintptr_t ENTITY_ACTION_MASK_OFFSET = 0x328;
 constexpr uint32_t ACTION_MASK_ATTACKING = 0xE0;         // states 5-7
 constexpr uint32_t ACTION_MASK_ATTACK = 0x20;            // state 5
+// Both sample sites also skip while the owner's playback flags
+// [entity+0xB0] have bit 0x4: the body is drawn blended from the last clip
+// into a new one (the body walk 0x7AA8C8 takes its blend path on it), for
+// about 5 ticks after every change of action - standing to walking,
+// walking to running, into an attack. The re-seated points ride the
+// controller, not the animation, so the bit is held clear while the sample
+// sites run and the trail has no gap at those changes.
+constexpr uintptr_t ENTITY_PLAYBACK_FLAGS_OFFSET = 0xB0;
+constexpr uint32_t PLAYBACK_BLENDING = 0x4;
 // A trail stops when the blade slows below this share of
 // weapon_trail_speed.
 constexpr float TRAIL_STOP_RATIO = 0.5f;
@@ -249,6 +264,7 @@ inline uint8_t current_category = 0;    // weapon item data[1] (byte +0xF3)
 inline uint8_t current_kind = WEAPON_KIND_NONE;  // WEAPON_KIND_TABLE[category]
 inline bool current_is_gun = false;     // KindIsGun(current_kind)
 inline bool current_twin_funnel = false;  // the funnel learner may latch a split
+inline bool current_two_pass = false;     // flags +0x1DC have WEAPON_FLAG_TWO_PASS
 inline bool current_twin_comp = false;    // a mechgun or twin-sword kind
 inline uint8_t current_variant = 0;       // item data[2] (+0xF4), logged
 inline uintptr_t current_attacking_fn = 0;  // vtbl+0xD0, logged
@@ -260,6 +276,12 @@ inline bool SwingWeapon() {
     if (current_weapon == nullptr)
         return vrmod::config.swing_unarmed;
     return !current_is_gun;
+}
+// The held weapon may draw a half in the off hand (a two-hander kind, the
+// two-pass flag, a mechgun or twin-sword kind). Known as soon as the weapon
+// is classified, before it is first drawn.
+inline bool MayDrawLeftHalf() {
+    return current_weapon != nullptr && (current_twin_funnel || current_twin_comp);
 }
 inline void* logged_weapon = reinterpret_cast<void*>(~uintptr_t(0));  // last classification logged
 inline bool bracket_open = false;       // inside the weapon object's draw
@@ -527,6 +549,13 @@ inline float first_rel[TWIN_MAX_PARTS][3] = {};  // baseline rel translations
 inline float max_dev[TWIN_MAX_PARTS] = {};       // max drift from baseline
 inline int settle = -1;                 // brackets left before latching
 inline int split_index = -1;            // first off-hand part; -1 = single-hand
+// The split taken from the held draw's own second pass (TakeGameSplit)
+// rather than learned; such a weapon's tail starts only once this bracket
+// has reached that second draw (BracketSplit).
+inline bool split_from_game = false;
+inline bool bracket_split_seen = false; // this bracket reached the second draw
+inline bool game_split_logged = false;  // this weapon's split line is written
+inline bool game_split_moved_logged = false;  // and its boundary-moved line
 inline D3DMATRIX left_root_inv = vrmod::Identity();
 inline bool have_left_grip = false;     // grip_world_left resolved this pass
 inline D3DMATRIX grip_world_left = vrmod::Identity();
@@ -560,12 +589,16 @@ inline bool have_trail_room = false;
 // The owner's action mask while it carries the forced attack bit.
 inline uint32_t* trail_mask = nullptr;
 inline uint32_t trail_mask_saved = 0;
+// The owner's playback flags while their blend bit is held clear.
+inline uint32_t* trail_blend = nullptr;
 inline uintptr_t current_owner = 0;     // the local player entity, per pass
 struct TrailSlot {
     float prev[2][3] = {};              // room-space endpoints (m)
+    float prev_world[2][3] = {};        // the same in world space (m)
     LONGLONG prev_qpc = 0;
     bool prev_valid = false;
     int hand = -1;                      // the hand of the last sample
+    unsigned jumps = 0;                 // gamecam::view_jumps at the last sample
     bool on = false;                    // fast enough: samples are kept
 };
 inline TrailSlot trail_slots[WEAPON_TRAIL_SLOT_COUNT];
@@ -585,6 +618,14 @@ inline int passes_since_bracket = 100;
 // the head sphere).
 inline bool ExemptingDraws() {
     return bracket_open && (have_grip || have_left_grip);
+}
+// The weapon geometry snapshot of one hand (0 main, 1 off-hand), or null,
+// and its generation counter (psobbvr_weaponsnap.hpp).
+inline std::shared_ptr<const weaponsnap::HeldGeometry> Held(int side) {
+    return weaponsnap::Held(side);
+}
+inline uint32_t HeldGeneration() {
+    return weaponsnap::Generation();
 }
 
 // grip_offset: rotation + translation in grip-local axes, labelled as the
@@ -621,13 +662,559 @@ inline D3DMATRIX FistTrim() {
                             vrmod::config.fist_up_cm, vrmod::config.fist_side_cm);
 }
 
-inline D3DMATRIX ActiveGripOffset() {
+// The melee seat per base weapon kind (WEAPON_KIND_TABLE's values): the
+// handles differ in length and shape (a saber's hand point sits near its
+// guard, a dagger's is already on the handle), so each kind has its own
+// slide along the blade, shift along the hand, shift out of the palm and
+// tilt about the palm axis, one value each, tuned on the reference hand
+// (eyeheight::REFERENCE_HAND_CLASS / REFERENCE_HAND_SHAPE).
+//
+// The game attaches the weapon to the grip point (bone 48) at the
+// weapon's own size, but blends the hand mesh from the class's proportion
+// shapes without moving that bone, so the closed fist sits differently
+// around the grip point on every build. The seat therefore starts from
+// the fist channel, the line a round handle rests along in the character's
+// closed fist (eyeheight::HandChannel), and the kind's values are offsets
+// from that line. A per-class trim corrects a class the channel places
+// wrongly. The live tables start from the defaults below.
+constexpr int kWeaponKindCount = 0x13;
+// Short kind names, for the logs.
+constexpr const char* kWeaponKindNames[kWeaponKindCount] = {
+    "knuckle", "saber", "sword", "dagger", "partisan",  // 0x00-0x04
+    "slicer", "handgun", "rifle", "mechgun", "shot",    // 0x05-0x09
+    "cane", "rod", "wand", "claw", "double saber",      // 0x0A-0x0E
+    "twin sword", "katana", "launcher", "card",         // 0x0F-0x12
+};
+inline const char* WeaponKindName(uint8_t kind) {
+    return kind < kWeaponKindCount ? kWeaponKindNames[kind] : "none";
+}
+// cm along the blade, positive toward the tip, added to [vr]
+// melee_slide_cm.
+constexpr float kMeleeSlideKindDefaultCm[kWeaponKindCount] = {
+    0.0f,  // 0x00 knuckle
+    9.0f,  // 0x01 saber
+    4.0f,  // 0x02 sword
+    0.0f,  // 0x03 dagger
+    0.0f,  // 0x04 partisan
+    2.0f,  // 0x05 slicer
+    0.0f,  // 0x06 handgun (guns never slide)
+    0.0f,  // 0x07 rifle
+    0.0f,  // 0x08 mechgun
+    0.0f,  // 0x09 shot
+    0.0f,  // 0x0A cane
+    0.0f,  // 0x0B rod
+    0.0f,  // 0x0C wand
+    0.0f,  // 0x0D claw (worn on the fist: never slides)
+    0.0f,  // 0x0E double saber
+    5.0f,  // 0x0F twin sword
+    7.5f,  // 0x10 katana (also the frying pan, fans and toy hammer)
+    0.0f,  // 0x11 launcher
+    0.0f,  // 0x12 card
+};
+// cm along the hand, from the wrist toward the fingers, added to the
+// class trim, from the fist channel's line. Tuned per kind on the
+// reference hand.
+constexpr float kMeleeHandKindDefaultCm[kWeaponKindCount] = {
+    0.0f,   // 0x00 knuckle
+    -0.75f, // 0x01 saber
+    0.0f,   // 0x02 sword
+    0.0f,   // 0x03 dagger
+    0.0f,   // 0x04 partisan
+    0.0f,   // 0x05 slicer
+    0.0f,   // 0x06 handgun (guns never shift)
+    0.0f,   // 0x07 rifle
+    0.0f,   // 0x08 mechgun
+    0.0f,   // 0x09 shot
+    0.0f,   // 0x0A cane
+    0.0f,   // 0x0B rod
+    0.0f,   // 0x0C wand
+    0.0f,   // 0x0D claw
+    0.0f,   // 0x0E double saber
+    0.0f,   // 0x0F twin sword
+    0.0f,   // 0x10 katana
+    0.0f,   // 0x11 launcher (a gun)
+    0.0f,   // 0x12 card
+};
+// cm out through the palm, added to [vr] melee_side_cm and the class
+// trim, from the fist channel's line. Tuned per kind on the reference
+// hand.
+constexpr float kMeleeSideKindDefaultCm[kWeaponKindCount] = {
+    0.0f,  // 0x00 knuckle
+    -0.4f, // 0x01 saber
+    0.0f,  // 0x02 sword
+    0.0f,  // 0x03 dagger
+    0.0f,  // 0x04 partisan
+    0.0f,  // 0x05 slicer
+    0.0f,  // 0x06 handgun (guns never shift)
+    0.0f,  // 0x07 rifle
+    0.0f,  // 0x08 mechgun
+    0.0f,  // 0x09 shot
+    0.0f,  // 0x0A cane
+    0.0f,  // 0x0B rod
+    0.0f,  // 0x0C wand
+    0.0f,  // 0x0D claw
+    0.0f,  // 0x0E double saber
+    0.0f,  // 0x0F twin sword
+    0.0f,  // 0x10 katana
+    0.0f,  // 0x11 launcher
+    0.0f,  // 0x12 card
+};
+// Degrees about the axis through the palm, added to [vr]
+// melee_pitch_deg.
+constexpr float kMeleePitchKindDefaultDeg[kWeaponKindCount] = {
+    0.0f,  // 0x00 knuckle
+    0.0f,  // 0x01 saber
+    0.0f,  // 0x02 sword
+    0.0f,  // 0x03 dagger
+    0.0f,  // 0x04 partisan
+    0.0f,  // 0x05 slicer
+    0.0f,  // 0x06 handgun (guns never tilt)
+    0.0f,  // 0x07 rifle
+    0.0f,  // 0x08 mechgun
+    0.0f,  // 0x09 shot
+    0.0f,  // 0x0A cane
+    0.0f,  // 0x0B rod
+    0.0f,  // 0x0C wand
+    0.0f,  // 0x0D claw
+    0.0f,  // 0x0E double saber
+    0.0f,  // 0x0F twin sword
+    0.0f,  // 0x10 katana
+    0.0f,  // 0x11 launcher
+    0.0f,  // 0x12 card
+};
+
+// Class names in class byte order (eyeheight's tables), for the logs.
+constexpr const char* kClassNames[eyeheight::CLASS_COUNT] = {
+    "HUmar", "HUnewearl", "HUcast",   "RAmar",    "RAcast", "RAcaseal",
+    "FOmarl", "FOnewm",   "FOnewearl", "HUcaseal", "FOmar",  "RAmarl",
+};
+inline const char* ClassName(int class_id) {
+    return class_id >= 0 && class_id < eyeheight::CLASS_COUNT ? kClassNames[class_id]
+                                                              : "unknown";
+}
+// A class's trim of the seat, cm along the hand and out of the palm, for
+// a class whose fist the channel places wrongly. Every melee kind gets it.
+struct SeatClassTrim {
+    float hand;
+    float side;
+};
+constexpr SeatClassTrim kMeleeClassTrimCm[eyeheight::CLASS_COUNT] = {
+    {0.0f, 0.0f},  // HUmar
+    {0.0f, 0.0f},  // HUnewearl
+    {0.0f, 0.0f},  // HUcast
+    {0.0f, 0.0f},  // RAmar
+    {0.0f, 0.0f},  // RAcast
+    {0.0f, 0.0f},  // RAcaseal
+    {0.0f, 0.0f},  // FOmarl
+    {0.0f, 0.0f},  // FOnewm
+    {0.0f, 0.0f},  // FOnewearl
+    {0.0f, 0.0f},  // HUcaseal
+    {0.0f, 0.0f},  // FOmar
+    {0.0f, 0.0f},  // RAmarl
+};
+inline float melee_slide_kind_cm[kWeaponKindCount] = {};
+inline float melee_hand_kind_cm[kWeaponKindCount] = {};
+inline float melee_side_kind_cm[kWeaponKindCount] = {};
+inline float melee_pitch_kind_deg[kWeaponKindCount] = {};
+inline SeatClassTrim melee_class_trim_cm[eyeheight::CLASS_COUNT] = {};
+inline bool melee_kind_init = false;
+
+// Fills the live tables from the defaults on first use.
+inline void MeleeKindTablesInit() {
+    if (melee_kind_init)
+        return;
+    for (int i = 0; i < kWeaponKindCount; i++) {
+        melee_slide_kind_cm[i] = kMeleeSlideKindDefaultCm[i];
+        melee_hand_kind_cm[i] = kMeleeHandKindDefaultCm[i];
+        melee_side_kind_cm[i] = kMeleeSideKindDefaultCm[i];
+        melee_pitch_kind_deg[i] = kMeleePitchKindDefaultDeg[i];
+    }
+    for (int i = 0; i < eyeheight::CLASS_COUNT; i++)
+        melee_class_trim_cm[i] = kMeleeClassTrimCm[i];
+    melee_kind_init = true;
+}
+
+// A kind's live value in one table, or null for no weapon / unknown kind.
+inline float* MeleeSlideKindEntry(uint8_t kind) {
+    MeleeKindTablesInit();
+    return kind < kWeaponKindCount ? &melee_slide_kind_cm[kind] : nullptr;
+}
+inline float* MeleeHandKindEntry(uint8_t kind) {
+    MeleeKindTablesInit();
+    return kind < kWeaponKindCount ? &melee_hand_kind_cm[kind] : nullptr;
+}
+inline float* MeleeSideKindEntry(uint8_t kind) {
+    MeleeKindTablesInit();
+    return kind < kWeaponKindCount ? &melee_side_kind_cm[kind] : nullptr;
+}
+inline float* MeleePitchKindEntry(uint8_t kind) {
+    MeleeKindTablesInit();
+    return kind < kWeaponKindCount ? &melee_pitch_kind_deg[kind] : nullptr;
+}
+
+// The character's live class trim, or null with no proportion seed (the
+// class is not known).
+inline SeatClassTrim* MeleeClassTrimEntry() {
+    MeleeKindTablesInit();
+    if (!eyeheight::seed_valid || eyeheight::seed_class < 0 ||
+        eyeheight::seed_class >= eyeheight::CLASS_COUNT)
+        return nullptr;
+    return &melee_class_trim_cm[eyeheight::seed_class];
+}
+inline float MeleeClassTrimHandCm() {
+    const SeatClassTrim* trim = MeleeClassTrimEntry();
+    return trim != nullptr ? trim->hand : 0.0f;
+}
+inline float MeleeClassTrimSideCm() {
+    const SeatClassTrim* trim = MeleeClassTrimEntry();
+    return trim != nullptr ? trim->side : 0.0f;
+}
+
+// The amounts of one melee seat: cm along the blade, along the hand and
+// out of the palm, degrees about the palm axis.
+struct MeleeAmounts {
+    float slide_cm;
+    float hand_cm;
+    float side_cm;
+    float pitch_deg;
+};
+
+// A kind's value; zero for no entry.
+inline float MeleeKindValue(const float* entry) {
+    return entry != nullptr ? *entry : 0.0f;
+}
+
+// A melee kind's amounts for a character of class_id (a negative class
+// takes no trim): slide = kind + [vr] melee_slide_cm; hand = kind + class
+// trim; side = kind + class trim + [vr] melee_side_cm; pitch = kind + [vr]
+// melee_pitch_deg. All zero for an unknown kind.
+inline MeleeAmounts MeleeAmountsFor(uint8_t kind, int class_id) {
+    MeleeKindTablesInit();
+    MeleeAmounts a = {};
+    if (kind >= kWeaponKindCount)
+        return a;
+    const SeatClassTrim* trim = class_id >= 0 && class_id < eyeheight::CLASS_COUNT
+                                    ? &melee_class_trim_cm[class_id]
+                                    : nullptr;
+    a.slide_cm = melee_slide_kind_cm[kind] + vrmod::config.melee_slide_cm;
+    a.hand_cm = melee_hand_kind_cm[kind] + (trim != nullptr ? trim->hand : 0.0f);
+    a.side_cm = melee_side_kind_cm[kind] + vrmod::config.melee_side_cm +
+                (trim != nullptr ? trim->side : 0.0f);
+    a.pitch_deg = melee_pitch_kind_deg[kind] + vrmod::config.melee_pitch_deg;
+    return a;
+}
+// The class whose trim the held weapon takes: the seeded character's, or
+// none.
+inline int MeleeSeatClass() {
+    return eyeheight::seed_valid ? eyeheight::seed_class : -1;
+}
+
+// The fist channel the seat uses: the seeded character's blended channel,
+// or the reference body's without a proportion seed (no angle follow).
+inline eyeheight::ChannelSeat MeleeCurrentChannel() {
+    float point[2], dir[3], anchor[3];
+    if (eyeheight::HandChannel(point, dir, anchor))
+        return eyeheight::ResolveChannel(point, dir, anchor, vrmod::config.melee_angle_follow);
+    eyeheight::HandChannelReference(point, dir, anchor);
+    return eyeheight::ResolveChannel(point, dir, anchor, 0.0f);
+}
+
+// The held weapon's slide in cm along the blade: its kind's value plus
+// [vr] melee_slide_cm. Zero for guns.
+inline float MeleeSlideCm() {
     if (current_is_gun)
-        return GripOffsetMatrix(vrmod::config.gun_pitch_deg,
-                                vrmod::config.gun_roll_deg,
-                                vrmod::config.gun_yaw_deg,
-                                vrmod::config.gun_fwd_cm,
-                                vrmod::config.gun_up_cm);
+        return 0.0f;
+    return MeleeAmountsFor(current_kind, MeleeSeatClass()).slide_cm;
+}
+
+// The held weapon's shift in cm along the hand, wrist toward fingers: its
+// kind's value and the class trim. Zero for guns.
+inline float MeleeHandCm() {
+    if (current_is_gun)
+        return 0.0f;
+    return MeleeAmountsFor(current_kind, MeleeSeatClass()).hand_cm;
+}
+
+// The held weapon's shift out of the palm in cm: its kind's value, [vr]
+// melee_side_cm and the class trim. Zero for guns.
+inline float MeleeSideCm() {
+    if (current_is_gun)
+        return 0.0f;
+    return MeleeAmountsFor(current_kind, MeleeSeatClass()).side_cm;
+}
+
+// The held weapon's tilt about the axis through the palm in degrees: its
+// kind's value plus [vr] melee_pitch_deg. Zero for guns.
+inline float MeleePitchDeg() {
+    if (current_is_gun)
+        return 0.0f;
+    return MeleeAmountsFor(current_kind, MeleeSeatClass()).pitch_deg;
+}
+
+
+// The melee seat matrix for amounts and a channel (row-vector, like the
+// rest): a translation along the blade, applied in the weapon's own frame
+// ahead of the grip so it follows the tuple's rotation. Melee models are
+// authored along +Z from the hand-attach point, tip at +Z (a saber runs
+// from -3 to +14), and in the hand frame +Z is the thumb side of the fist,
+// where a held blade leaves it. Then the tilt about the frame's X (through
+// the palm), about the attach point, so the blade slide stays along the
+// blade. Then the shift along the frame's -Y, the hand's own length from
+// the wrist toward the fingers, and the side shift along its X, out
+// through the palm. Last the channel: the handle's axis (+Z through the
+// attach point) is laid on the line the fist holds it along, a turn about
+// X by the channel's tilt, a turn about Y by its yaw, and a move to the
+// channel's point at z = 0 (game units already).
+inline D3DMATRIX MeleeSeatMatrix(const MeleeAmounts& amounts,
+                                 const eyeheight::ChannelSeat& channel) {
+    const float cm = 0.01f * vrmod::config.world_scale;
+    D3DMATRIX blade = vrmod::Identity();
+    blade._43 = amounts.slide_cm * cm;
+    D3DMATRIX tilt = vrmod::Identity();
+    const float a = amounts.pitch_deg * (3.14159265f / 180.0f);
+    tilt._22 = cosf(a); tilt._23 = sinf(a); tilt._32 = -sinf(a); tilt._33 = cosf(a);
+    D3DMATRIX hand = vrmod::Identity();
+    hand._41 = amounts.side_cm * cm;
+    hand._42 = -amounts.hand_cm * cm;
+    D3DMATRIX rx = vrmod::Identity(), ry = vrmod::Identity(), move = vrmod::Identity();
+    rx._22 = cosf(channel.tilt); rx._23 = sinf(channel.tilt);
+    rx._32 = -sinf(channel.tilt); rx._33 = cosf(channel.tilt);
+    ry._11 = cosf(channel.yaw); ry._13 = -sinf(channel.yaw);
+    ry._31 = sinf(channel.yaw); ry._33 = cosf(channel.yaw);
+    move._41 = channel.point[0];
+    move._42 = channel.point[1];
+    const D3DMATRIX offsets = vrmod::Multiply(vrmod::Multiply(blade, tilt), hand);
+    return vrmod::Multiply(offsets, vrmod::Multiply(vrmod::Multiply(rx, ry), move));
+}
+
+// A kind's seat for a character of class_id with this fist channel:
+// identity for guns.
+inline D3DMATRIX MeleeSeatFor(uint8_t kind, int class_id, const eyeheight::ChannelSeat& channel) {
+    if (KindIsGun(kind))
+        return vrmod::Identity();
+    return MeleeSeatMatrix(MeleeAmountsFor(kind, class_id), channel);
+}
+
+// The held melee weapon's seat in the character's own fist: the weapon in
+// the hand's frame. Identity for guns.
+inline D3DMATRIX MeleeSlide() {
+    return MeleeSeatFor(current_kind, MeleeSeatClass(), MeleeCurrentChannel());
+}
+
+// The off-hand's seat: the main hand's seat mirrored across the hand
+// frame's x (X M X with X = diag(-1, 1, 1)). The left hand is drawn as the
+// right hand's geometry with that x negated while both controller frames
+// keep the same handedness, so out of the left palm is -x: the side shift,
+// the channel's point x and its yaw change sign; the slide, the shift
+// along the hand and the tilt do not. Still a rigid motion, so the weapon
+// itself is not reflected (gunseat::Mirrored).
+inline D3DMATRIX MirroredSeat(const D3DMATRIX& m) {
+    D3DMATRIX r;
+    gunseat::Mirrored(&m._11, &r._11);
+    return r;
+}
+
+// The melee weapon on the controller's line ([vr] melee_hand_seat 1, IK arms
+// posing the hands). A fist's channel points a different way on every class
+// and build, so a weapon seated in the character's own fist leaves the
+// controller at a different angle on each. Here the weapon is drawn where the
+// reference hand holds it, MeleeLineSeat x grip tuple x controller, the same
+// on every character, and the hand is moved to inverse(MeleeSlide) x that
+// frame, so the weapon still lies in the fist exactly as MeleeSlide seats it
+// (gunseat::Place). The reference character's hand does not move.
+
+// The floors where the game does not draw a held weapon: the town (the
+// entity's floor id 0) and the lobbies (15). An equipped weapon there leaves
+// the hands as they are with nothing held: not moved onto it, not shaped
+// around it.
+constexpr uint32_t FLOOR_TOWN = 0;
+constexpr uint32_t FLOOR_LOBBY = 15;
+// Decided once per pass (OnFrame).
+inline bool weapons_hidden = false;
+inline bool WeaponsHiddenNow() {
+    const uintptr_t entity = gamecam::ResolveEntity();
+    if (entity == 0 || !diag::Accessible(entity + gamecam::ENTITY_FLOOR_OFFSET, 4, false))
+        return false;
+    const uint32_t floor = *reinterpret_cast<const uint32_t*>(entity + gamecam::ENTITY_FLOOR_OFFSET);
+    return floor == FLOOR_TOWN || floor == FLOOR_LOBBY;
+}
+
+// Whether IK arms pose the hands, as of their last pass (written by ikarms,
+// which runs after this file's OnFrame).
+inline bool ik_poses_hands = false;
+// Decided once per pass (OnFrame): the held melee weapon is drawn on the
+// controller's line this pass.
+inline bool melee_on_line = false;
+// Passes since an off-hand weapon half was last drawn on the left grip frame,
+// by either path, and whether one was this pass.
+inline bool left_weapon_drew = false;
+inline int passes_since_left_weapon = 100;
+// Passes the left hand stays on an off-hand half that is not being drawn.
+// The game does not draw a newly equipped weapon for 37 passes, so this is
+// longer: a twin changed for another twin keeps the left hand where it is. A
+// twin changed for a one-handed weapon leaves the empty left hand turned for
+// this long.
+constexpr int MELEE_LEFT_UNDRAWN_PASSES = 45;
+
+// The held melee weapon's seat on the reference hand's channel, without a
+// class trim: where it sits from the grip frame once the hand is moved onto
+// it. Identity for guns.
+inline D3DMATRIX MeleeLineSeat() {
+    float point[2], dir[3], anchor[3];
+    eyeheight::HandChannelReference(point, dir, anchor);
+    return MeleeSeatFor(current_kind, -1, eyeheight::ResolveChannel(point, dir, anchor, 0.0f));
+}
+
+// Why the held melee weapon is not put on the controller's line; null when
+// it is.
+inline const char* MeleeOffLineWhy() {
+    float point[2], dir[3], anchor[3];
+    if (vrmod::config.melee_hand_seat != 1)
+        return "melee_hand_seat 0";
+    if (!ik_poses_hands)
+        return "IK arms off";
+    if (current_weapon == nullptr)
+        return "nothing held";
+    if (current_is_gun)
+        return "a gun held";
+    if (weapons_hidden)
+        return "weapons are not drawn on this floor";
+    if (!eyeheight::HandChannel(point, dir, anchor))
+        return "no fist channel";
+    return nullptr;
+}
+
+// The seat the held melee weapon is drawn on this pass, from the grip frame.
+inline D3DMATRIX MeleeDrawSeat() {
+    return melee_on_line ? MeleeLineSeat() : MeleeSlide();
+}
+
+// Why a hand (0 left, 1 right) is not moved onto the melee weapon this pass;
+// null when it is. The right hand moves whenever the weapon is on the
+// controller's line and not seated off the hand bone (drawn then on the
+// fist-trimmed frame), whether or not the weapon is being drawn, as for a
+// gun: the game leaves a newly equipped weapon undrawn for a while, and a
+// hand that waited for the draw would jump at every change of weapon. The
+// left hand moves only while an off-hand half is drawn in it.
+inline const char* MeleeHandStaysWhy(int side) {
+    if (!melee_on_line) {
+        const char* why = MeleeOffLineWhy();
+        return why != nullptr ? why : "not on the line this pass";
+    }
+    if (side == 0)
+        return passes_since_left_weapon <= MELEE_LEFT_UNDRAWN_PASSES ? nullptr
+                                                                    : "no weapon half drawn in this hand";
+    return seat_on_fist ? "the weapon is held off the hand bone" : nullptr;
+}
+inline bool MeleeHandMoves(int side) {
+    return MeleeHandStaysWhy(side) == nullptr;
+}
+
+// The hand (IK wrist target) for a grip frame (grip tuple x controller) with
+// the melee weapon on the controller's line: inverse(the weapon in this
+// hand's frame) x the weapon's frame. The weapon's frame is not changed.
+inline D3DMATRIX HandOnMelee(int side, const D3DMATRIX& grip_frame) {
+    D3DMATRIX in_hand = MeleeSlide(), on_line = MeleeLineSeat();
+    if (side == 0) {
+        in_hand = MirroredSeat(in_hand);
+        on_line = MirroredSeat(on_line);
+    }
+    const D3DMATRIX weapon = vrmod::Multiply(on_line, grip_frame);
+    const gunseat::Placement p = gunseat::Place(true, &weapon._11, &in_hand._11);
+    D3DMATRIX hand;
+    memcpy(&hand._11, p.hand, sizeof(p.hand));
+    return hand;
+}
+
+// A gun's seat on this fist channel (gunseat::SeatMatrix): the gun carried so
+// its kind's handle line lies on the channel, then slid along it by the
+// offsets' slide (gunseat::kSlideDefaultCm by default). It stands where the
+// melee seat stands, after the part matrix's scale about the weapon root. Guns are drawn on the identity
+// seat (MeleeSeatFor), so the gun and its shot ray stay where the gun's frame
+// (ActiveGripOffset) puts them; the inverse of this seat places the hand
+// against the gun. False, with the identity, for a kind without a handle
+// line.
+static_assert(gunseat::kKindCount == kWeaponKindCount, "the gun seat's kinds are the weapon kinds");
+static_assert(gunseat::kMechgunKind == WEAPON_KIND_MECHGUN, "the gun seat's mechgun kind");
+inline bool GunSeatMatrix(uint8_t kind, const eyeheight::ChannelSeat& channel, float world_scale,
+                          float weapon_scale, D3DMATRIX& out,
+                          const gunseat::Amounts& amounts = gunseat::DefaultAmounts()) {
+    const gunseat::Channel c = {{channel.point[0], channel.point[1]}, channel.tilt, channel.yaw};
+    return gunseat::SeatMatrixF(kind, c, amounts, world_scale, weapon_scale, &out._11);
+}
+
+// The gun seat's offsets in use (gunseat::Amounts); starts at the defaults.
+inline gunseat::Amounts gun_seat_amounts = {gunseat::kSlideDefaultCm, 0.0, 0.0, 0.0, 0.0};
+
+// Passes since an off-hand half was last re-seated onto the left grip, and
+// whether one was this pass (SubstituteWorld). The world draws on alternating
+// passes, so a gap of 3 still counts as drawn.
+inline bool left_half_drew = false;
+inline int passes_since_left_half = 100;
+inline bool LeftHalfDrawn() {
+    return passes_since_left_half <= 3;
+}
+
+// What the gun seat does to one hand this pass (side: 0 left, 1 right).
+struct HeldSeat {
+    gunseat::Why why = gunseat::Why::NoGun;
+    int line_kind = -1;                  // the kind whose handle line the item takes, -1 none
+    bool have_seat = false;              // seat is the gun seat (a line and a fist channel)
+    D3DMATRIX seat = vrmod::Identity();  // the gun in this hand's grip frame (mirrored for the left)
+    bool Moves() const { return why == gunseat::Why::Moves; }
+};
+
+// The held gun in one hand's grip frame, the one place the IK wrist target,
+// the fist closing and the hand fit all take it from: with [vr] gun_seat 1 and
+// IK arms posing the hand, a gun with a handle line (gunseat::LineKind on its
+// item code) is held on the gun seat, and the hand is moved onto it
+// (gunseat::Place). The right hand whenever such a gun is held, the left only
+// while a mechgun half is drawn in it, on the mirrored seat. Otherwise
+// nothing moves and the gun stays at the identity in the hand's frame.
+// half_expected: the left hand's seat whether or not its half has been drawn
+// yet (where the half is drawn, as against where the hand goes).
+inline HeldSeat GunSeatForHand(int side, bool ik_arms, bool half_expected = false) {
+    HeldSeat r;
+    float point[2], dir[3], anchor[3];
+    gunseat::HandInput in;
+    in.setting = vrmod::config.gun_seat;
+    // Where the game does not draw weapons the hand has no gun to go to.
+    in.gun = current_weapon != nullptr && current_is_gun && !weapons_hidden;
+    in.kind = current_kind;
+    in.code = gunseat::ItemCode(current_category, current_variant);
+    in.side = side;
+    in.left_half_drawn = half_expected || LeftHalfDrawn();
+    in.channel = eyeheight::HandChannel(point, dir, anchor);
+    in.ik_arms = ik_arms;
+    // A weapon seated off the hand bone is drawn on the fist-trimmed frame,
+    // not the gun frame the hand would be moved against.
+    in.on_grip = side == 0 ? !left_on_fist : !seat_on_fist;
+    r.why = gunseat::Decide(in, r.line_kind);
+    if (r.line_kind >= 0 && in.channel) {
+        D3DMATRIX m;
+        if (GunSeatMatrix((uint8_t)r.line_kind, MeleeCurrentChannel(), vrmod::config.world_scale,
+                          vrmod::config.weapon_scale, m, gun_seat_amounts)) {
+            r.seat = side == 0 ? MirroredSeat(m) : m;
+            r.have_seat = true;
+        }
+    }
+    if (r.why == gunseat::Why::Moves && !r.have_seat)
+        r.why = gunseat::Why::NoLine;
+    return r;
+}
+
+// The hand (IK wrist target) for a gun frame (grip tuple x controller) on a
+// hand's gun seat: inverse(seat) x gun frame. The gun frame itself is not
+// changed (gunseat::Place).
+inline D3DMATRIX HandOnGun(const HeldSeat& s, const D3DMATRIX& gun_frame) {
+    const gunseat::Placement p = gunseat::Place(s.Moves(), &gun_frame._11, &s.seat._11);
+    D3DMATRIX hand;
+    memcpy(&hand._11, p.hand, sizeof(p.hand));
+    return hand;
+}
+
+// The melee grip tuple, which is also the bare hand's.
+inline D3DMATRIX BareGripOffset() {
     return GripOffsetMatrix(vrmod::config.grip_pitch_deg,
                             vrmod::config.grip_roll_deg,
                             vrmod::config.grip_yaw_deg,
@@ -635,46 +1222,128 @@ inline D3DMATRIX ActiveGripOffset() {
                             vrmod::config.grip_up_cm);
 }
 
+// Where a hand (0 left, 1 right) holding a weapon sits from the bare hand's
+// frame (melee grip tuple x controller): with melee weapons on the
+// controller's line, the character's fist channel laid on the reference
+// hand's, the class trim included. This is where HandOnMelee puts the hand
+// for every melee kind (a kind's own amounts cancel between the two seats).
+// The identity when melee weapons are not put on the line.
+inline D3DMATRIX HandOnLine(int side) {
+    float point[2], dir[3], anchor[3];
+    if (vrmod::config.melee_hand_seat != 1 || !ik_poses_hands || !eyeheight::HandChannel(point, dir, anchor))
+        return vrmod::Identity();
+    MeleeKindTablesInit();
+    MeleeAmounts own = {}, line = {};
+    const int class_id = MeleeSeatClass();
+    if (class_id >= 0 && class_id < eyeheight::CLASS_COUNT) {
+        own.hand_cm = melee_class_trim_cm[class_id].hand;
+        own.side_cm = melee_class_trim_cm[class_id].side;
+    }
+    float ref_point[2], ref_dir[3], ref_anchor[3];
+    eyeheight::HandChannelReference(ref_point, ref_dir, ref_anchor);
+    D3DMATRIX in_hand = MeleeSeatMatrix(own, MeleeCurrentChannel());
+    D3DMATRIX on_line = MeleeSeatMatrix(line, eyeheight::ResolveChannel(ref_point, ref_dir, ref_anchor, 0.0f));
+    if (side == 0) {
+        in_hand = MirroredSeat(in_hand);
+        on_line = MirroredSeat(on_line);
+    }
+    const gunseat::Placement p = gunseat::Place(true, &on_line._11, &in_hand._11);
+    D3DMATRIX hand;
+    memcpy(&hand._11, p.hand, sizeof(p.hand));
+    return hand;
+}
+
+// [vr] gun_to_hand (with gun_seat, IK arms posing the hands): a held gun is
+// placed from the hand, not from its own grip tuple. The hand stays where it
+// holds a melee weapon (HandOnLine x melee grip tuple x controller) and the
+// gun is drawn where its seat in that hand puts it, so the hand does not move
+// between a melee weapon and a gun; the gun's angle to the controller then
+// follows from its handle line and the fist channel. A hand that holds no
+// part of the gun is on the bare hand's frame.
+inline bool GunToHand() {
+    return vrmod::config.gun_to_hand == 1 && vrmod::config.gun_seat == 1 && ik_poses_hands;
+}
+
+// A gun's frame from a hand's controller (0 left, 1 right): its seat in the
+// hand x the hand's place, turned by [vr] gun_hand_pitch_deg about the axis
+// through the palm at the grip point (barrel up positive; the wrist turns
+// with it). The gun grip tuple without gun_to_hand or for a gun with no seat.
+inline D3DMATRIX GunFrameOffset(int side) {
+    if (GunToHand()) {
+        const HeldSeat s = GunSeatForHand(side, true, true);
+        if (s.Moves()) {
+            const D3DMATRIX turn = GripOffsetMatrix(vrmod::config.gun_hand_pitch_deg, 0.0f, 0.0f, 0.0f, 0.0f);
+            const D3DMATRIX hand = vrmod::Multiply(turn, vrmod::Multiply(HandOnLine(side), BareGripOffset()));
+            return vrmod::Multiply(s.seat, hand);
+        }
+    }
+    return GripOffsetMatrix(vrmod::config.gun_pitch_deg,
+                            vrmod::config.gun_roll_deg,
+                            vrmod::config.gun_yaw_deg,
+                            vrmod::config.gun_fwd_cm,
+                            vrmod::config.gun_up_cm);
+}
+
+// The frame of what a hand holds, from its controller: a gun's
+// (GunFrameOffset), else the melee grip tuple, which is also the bare
+// hand's (and a gun's where the game does not draw it).
+inline D3DMATRIX ActiveGripOffset(int side = 1) {
+    if (current_is_gun && !weapons_hidden)
+        return GunFrameOffset(side);
+    return BareGripOffset();
+}
+
+// With gun_to_hand, a left hand with no gun half drawn in it is placed as an
+// empty hand, whatever the right hand holds.
+inline bool LeftHandBareOfGun() {
+    return GunToHand() && current_is_gun && !weapons_hidden && !LeftHalfDrawn();
+}
+
+// An empty hand's place from its controller: with [vr] bare_hand_on_line,
+// where it holds a weapon (HandOnLine x the bare hand's frame), so it does not
+// turn when a weapon is equipped or put away; else the bare hand's frame.
+inline D3DMATRIX EmptyHandOffset(int side) {
+    if (vrmod::config.bare_hand_on_line == 1)
+        return vrmod::Multiply(HandOnLine(side), BareGripOffset());
+    return BareGripOffset();
+}
+
+// A hand's place from its controller, the IK wrist target (0 left, 1 right):
+// on the gun's seat for a hand holding a gun by its handle, on the gun's
+// frame for a gun with no seat, on the melee weapon kept on the controller's
+// line, on the grip frame for a main-hand weapon seated off the hand bone (it
+// is drawn on a trim of that frame), and otherwise as an empty hand.
+inline D3DMATRIX HandOffset(int side) {
+    if (current_is_gun && !weapons_hidden) {
+        const HeldSeat s = GunSeatForHand(side, true);
+        if (s.Moves())
+            return HandOnGun(s, GunFrameOffset(side));
+        if (side == 0 && LeftHandBareOfGun())
+            return EmptyHandOffset(side);
+        return GunFrameOffset(side);
+    }
+    if (MeleeHandMoves(side))
+        return HandOnMelee(side, BareGripOffset());
+    if (side == 1 && current_weapon != nullptr && !weapons_hidden && seat_on_fist)
+        return BareGripOffset();
+    return EmptyHandOffset(side);
+}
+
 // A hand's barrel ray (origin, unit forward, world units): the -Y axis
-// (muzzle end) of the frame the gun is drawn in, grip tuple x hand world
-// pose, so the ray is the visible barrel. pitch_trim_deg tilts it about
-// the weapon's side axis, positive = toward world down. Works for either
-// hand (the grip frames and tuples are mirror-symmetric). False with no
-// pose or before the head pose is written this frame.
+// (muzzle end) of the frame the gun is drawn in, ActiveGripOffset x hand
+// world pose, so the ray is the visible barrel (gunseat::RayFromFrame).
+// pitch_trim_deg tilts it about the weapon's side axis, positive = toward
+// world down. Works for either hand (the left hand's frame is the right's
+// mirrored). False with no pose or before the head pose is written this
+// frame.
 inline bool BarrelRay(int hand, float* origin, float* fwd,
                       float pitch_trim_deg) {
     D3DMATRIX pose, hand_world;
     if (!vrmod::Get()->GetHandPose(hand & 1, pose) ||
         !gamecam::WorldFromTracking(pose, hand_world))
         return false;
-    const D3DMATRIX m = vrmod::Multiply(ActiveGripOffset(), hand_world);
-    float f[3] = {-m._21, -m._22, -m._23};  // row 2 = the weapon's Y axis; muzzle on -Y
-    float len = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-    if (len < 1e-6f)
-        return false;
-    f[0] /= len; f[1] /= len; f[2] /= len;
-    if (pitch_trim_deg != 0.0f) {
-        // Side axis = row 1 (the weapon's X). t = side x fwd, signed so
-        // positive trim tilts toward world down (-Y).
-        float ax[3] = {m._11, m._12, m._13};
-        const float al = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
-        if (al > 1e-6f) {
-            ax[0] /= al; ax[1] /= al; ax[2] /= al;
-            float t[3] = {ax[1] * f[2] - ax[2] * f[1],
-                          ax[2] * f[0] - ax[0] * f[2],
-                          ax[0] * f[1] - ax[1] * f[0]};
-            if (t[1] > 0.0f) {
-                t[0] = -t[0]; t[1] = -t[1]; t[2] = -t[2];
-            }
-            const float a = pitch_trim_deg * (3.14159265f / 180.0f);
-            const float c = cosf(a), s = sinf(a);
-            for (int i = 0; i < 3; i++)
-                f[i] = f[i] * c + t[i] * s;
-        }
-    }
-    fwd[0] = f[0]; fwd[1] = f[1]; fwd[2] = f[2];
-    origin[0] = m._41; origin[1] = m._42; origin[2] = m._43;
-    return true;
+    const D3DMATRIX m = vrmod::Multiply(ActiveGripOffset(hand & 1), hand_world);
+    return gunseat::RayFromFrame(&m._11, pitch_trim_deg, origin, fwd);
 }
 
 inline void ResetLearning() {
@@ -682,8 +1351,47 @@ inline void ResetLearning() {
     learn_count = -1;
     settle = -1;
     split_index = -1;
+    split_from_game = false;
     for (int i = 0; i < TWIN_MAX_PARTS; i++)
         max_dev[i] = 0.0f;
+}
+
+// The split in force for the part being set: a split from the game's second
+// draw applies only after this bracket has reached it.
+inline int BracketSplit() {
+    return split_from_game && !bracket_split_seen ? -1 : split_index;
+}
+
+// The held draw's two-pass path (0x5E8088 with WEAPON_FLAG_TWO_PASS) draws
+// every matrix of the bone-48 half, then sets bone 35 (0x5E817E) and calls
+// 0x5E84A8 again for the other half, so the part count at that call is the
+// first off-hand part. Taken on every funnel bracket that reaches it, from
+// the first one after equipping; once set, the learner stays off.
+inline void TakeGameSplit(int bone) {
+    if (!bracket_learns || !vrmod::config.twin_split || !current_twin_funnel ||
+        !current_two_pass || part_index <= 0)
+        return;
+    bracket_split_seen = true;
+    draws_left_half = true;
+    if (split_from_game && split_index == part_index)
+        return;
+    const int before = split_index;
+    const bool before_from_game = split_from_game;
+    split_index = part_index;
+    split_from_game = true;
+    if (!game_split_logged) {
+        game_split_logged = true;
+        if (before >= 0 && before != part_index)
+            diag::Log("weapongrip: twin split at part %d from the game's second draw (bone %d), "
+                      "replacing the learned part %d", part_index, bone, before);
+        else
+            diag::Log("weapongrip: twin split at part %d from the game's second draw (bone %d)",
+                      part_index, bone);
+    } else if (before_from_game && !game_split_moved_logged) {
+        game_split_moved_logged = true;
+        diag::Log("weapongrip: the game's second draw moved the twin split from part %d to %d",
+                  before, part_index);
+    }
 }
 
 // Shared by both bracket hooks (funnel + composite entry). Returns whether
@@ -697,6 +1405,8 @@ inline bool BracketOpen(void* self, const char* which, bool left,
     bracket_learns = learns;
     bracket_fired = true;
     part_index = 0;
+    bracket_split_seen = false;
+    weaponsnap::OnBracket(left);
     return true;
 }
 
@@ -755,32 +1465,51 @@ inline bool TrailFromHand(void* weapon) {
            weapon == current_weapon && !current_is_gun;
 }
 
-// Gives the owner's action mask an attack bit for the sample sites, when
-// it has none and the weapon keeps its shape outside attacks. Returns
-// whether this call forced it (and must restore).
+// Opens the sample sites' conditions for a trail fed from the hand: holds
+// the owner's blend bit clear (weapon_trail_blend), and gives its action
+// mask an attack bit when it has none and the weapon keeps its shape
+// outside attacks. Returns whether this call changed either (and must
+// restore).
 inline bool ForceTrailMask(void* weapon) {
-    if (trail_mask != nullptr || trail_reshapes || !TrailFromHand(weapon))
+    if (trail_mask != nullptr || trail_blend != nullptr || !TrailFromHand(weapon))
         return false;
     const uintptr_t w = reinterpret_cast<uintptr_t>(weapon);
     if (!diag::Accessible(w + WEAPON_OWNER_OFFSET, 4, false))
         return false;
     const uintptr_t owner = *reinterpret_cast<const uintptr_t*>(w + WEAPON_OWNER_OFFSET);
     if (owner == 0 || owner != current_owner ||
-        !diag::Accessible(owner + ENTITY_ACTION_MASK_OFFSET, 4, true))
+        !diag::Accessible(owner + ENTITY_ACTION_MASK_OFFSET, 4, true) ||
+        !diag::Accessible(owner + ENTITY_PLAYBACK_FLAGS_OFFSET, 4, true))
         return false;
+    bool forced = false;
     uint32_t* const mask = reinterpret_cast<uint32_t*>(owner + ENTITY_ACTION_MASK_OFFSET);
-    if ((*mask & ACTION_MASK_ATTACKING) != 0)
-        return false;  // attacking: the game samples anyway
-    trail_mask_saved = *mask;
-    *mask = trail_mask_saved | ACTION_MASK_ATTACK;
-    trail_mask = mask;
-    return true;
+    // Attacking: the game passes the mask test itself.
+    const bool attacking = (*mask & ACTION_MASK_ATTACKING) != 0;
+    if (!attacking && !trail_reshapes) {
+        trail_mask_saved = *mask;
+        *mask = trail_mask_saved | ACTION_MASK_ATTACK;
+        trail_mask = mask;
+        forced = true;
+    }
+    // Only when the mask test passes: otherwise nothing is sampled.
+    uint32_t* const playback =
+        reinterpret_cast<uint32_t*>(owner + ENTITY_PLAYBACK_FLAGS_OFFSET);
+    if (vrmod::config.weapon_trail_blend && (attacking || forced) &&
+        (*playback & PLAYBACK_BLENDING) != 0) {
+        *playback &= ~PLAYBACK_BLENDING;
+        trail_blend = playback;
+        forced = true;
+    }
+    return forced;
 }
 
 inline void RestoreTrailMask() {
     if (trail_mask != nullptr)
         *trail_mask = trail_mask_saved;
     trail_mask = nullptr;
+    if (trail_blend != nullptr)
+        *trail_blend |= PLAYBACK_BLENDING;
+    trail_blend = nullptr;
 }
 
 inline void __fastcall HookDraw(void* self, void* edx) {
@@ -795,27 +1524,36 @@ inline void __fastcall HookDraw(void* self, void* edx) {
 }
 
 // The composite entry: the held draw's two-pass path calls it inside its
-// own bracket (folded in); the class draws (+0xD8) and the mechguns'
-// 0x5E74EC call it once per half. A half drawn on a left-arm bone is the
-// off hand.
+// own bracket (folded in; its left-arm call marks the twin split); the
+// class draws (+0xD8) and the mechguns' 0x5E74EC call it once per half. A
+// half drawn on a left-arm bone is the off hand.
 inline void __fastcall HookCompDraw(void* self, void* edx) {
     bool owns = false;
     if (self != nullptr && self == current_weapon) {
-        const bool left = vrmod::config.twin_split && IsLeftArmBone(ReadAttachBone());
+        const int bone = ReadAttachBone();
+        const bool left = vrmod::config.twin_split && IsLeftArmBone(bone);
         owns = BracketOpen(self, "comp", left, false);
         if (owns && left)
             draws_left_half = true;
+        else if (!owns && left) {
+            TakeGameSplit(bone);
+        }
     }
-    // The model draw sees the real action mask; the held draw's samples
-    // after it see the forced one again.
+    // The model draw sees the real action mask and blend bit; the held
+    // draw's samples after it see the forced ones again.
     uint32_t* const forced = trail_mask;
+    uint32_t* const blend = trail_blend;
     if (forced != nullptr)
         *forced = trail_mask_saved;
+    if (blend != nullptr)
+        *blend |= PLAYBACK_BLENDING;
     original_comp_draw(self, edx);
     if (forced != nullptr) {
         trail_mask_saved = *forced;
         *forced = trail_mask_saved | ACTION_MASK_ATTACK;
     }
+    if (blend != nullptr)
+        *blend &= ~PLAYBACK_BLENDING;
     if (owns)
         BracketClose();
 }
@@ -841,18 +1579,22 @@ inline float Distance3(const float a[3], const float b[3]) {
     return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
-// Whether this slot's blade moves fast enough in room space for a trail:
-// starts at weapon_trail_speed, stops below TRAIL_STOP_RATIO of it.
-// Walking and turning move the world, not the room, so they never count.
+// Whether this slot's blade moves fast enough for a trail: starts at
+// weapon_trail_speed, stops below TRAIL_STOP_RATIO of it. The speed is
+// the blade's through the world, so the character walking, running or
+// turning counts as well as the hand's own swing; with weapon_trail_moving
+// off it is the speed in room space, which only the hand changes.
 inline bool TrailFast(int slot, const float wa[3], const float wb[3], float& speed) {
     TrailSlot& s = trail_slots[slot];
     const float ws = vrmod::config.world_scale;
-    float ra[3], rb[3];
+    float ra[3], rb[3], ma[3], mb[3];
     TransformPoint(wa, trail_room_from_world, ra);
     TransformPoint(wb, trail_room_from_world, rb);
     for (int i = 0; i < 3; i++) {
         ra[i] /= ws;
         rb[i] /= ws;
+        ma[i] = wa[i] / ws;
+        mb[i] = wb[i] / ws;
     }
     LARGE_INTEGER qpc;
     QueryPerformanceCounter(&qpc);
@@ -869,7 +1611,13 @@ inline bool TrailFast(int slot, const float wa[3], const float wb[3], float& spe
         if (dt < 0.25) {
             const float da = Distance3(ra, s.prev[0]);
             const float db = Distance3(rb, s.prev[1]);
-            speed = (float)((da > db ? da : db) / dt);
+            const float wda = Distance3(ma, s.prev_world[0]);
+            const float wdb = Distance3(mb, s.prev_world[1]);
+            const float hand = (float)((da > db ? da : db) / dt);
+            const float world = (float)((wda > wdb ? wda : wdb) / dt);
+            diag::trail_speed_hand = hand;
+            diag::trail_speed_world = world;
+            speed =vrmod::config.weapon_trail_moving ? world : hand;
             const float start = vrmod::config.weapon_trail_speed;
             s.on = s.on ? speed >= start * TRAIL_STOP_RATIO : speed >= start;
         } else {
@@ -881,11 +1629,14 @@ inline bool TrailFast(int slot, const float wa[3], const float wb[3], float& spe
     for (int i = 0; i < 3; i++) {
         s.prev[0][i] = ra[i];
         s.prev[1][i] = rb[i];
+        s.prev_world[0][i] = ma[i];
+        s.prev_world[1][i] = mb[i];
     }
     s.prev_qpc = qpc.QuadPart;
     s.prev_valid = true;
     return s.on;
 }
+
 
 // The trail's add routine: the local weapon's samples move onto the
 // re-seated weapon and are kept only on a fast swing. With no re-seat
@@ -904,9 +1655,14 @@ inline void __fastcall HookTrailAdd(void* self, void* edx, float* a, float* b) {
     }
     // A slot that changed hands (the twin split latching) jumped rather
     // than swung: restart its speed test and empty its ribbon, so the add's
-    // smoothing does not bridge the two hands.
+    // smoothing does not bridge the two hands. The same when the view
+    // jumped (snap turn, recenter, warp) and the speed is the blade's
+    // through the world.
     TrailSlot& ts = trail_slots[slot];
-    if (ts.prev_valid && ts.hand != trail_map_hand) {
+    const bool view_jumped = vrmod::config.weapon_trail_moving &&
+                             ts.jumps != gamecam::view_jumps;
+    ts.jumps = gamecam::view_jumps;
+    if (ts.prev_valid && (ts.hand != trail_map_hand || view_jumped)) {
         ts.prev_valid = false;
         ts.on = false;
         const uintptr_t t = reinterpret_cast<uintptr_t>(self);
@@ -1090,6 +1846,9 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
                 settle = TWIN_SETTLE_BRACKETS;
         }
     }
+    const int split = BracketSplit();
+    weaponsnap::NoteMatrix(in, i, bracket_is_left, split, root_inv,
+                           bracket_is_left ? left_on_fist : seat_on_fist, boxed);
     // Boxed radar/menu passes use their own camera and keep the game's
     // matrices.
     if (boxed)
@@ -1108,11 +1867,14 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
         out = vrmod::Multiply(rel, grip);
         NoteTrailMap(root_inv, grip, 0);
         subst_sets_left++;
+        left_half_drew = true;
+        if (!left_on_fist)
+            left_weapon_drew = true;
         return true;
     }
     // Off-hand tail: to the left grip, rooted at its own first part.
-    if (split_index > 0 && i >= split_index) {
-        if (i == split_index) {
+    if (split > 0 && i >= split) {
+        if (i == split) {
             // Funnel-path twin: this part rides the left hand bone.
             vrmod::hand_bone_world_left = in;
             vrmod::have_hand_bone_left = true;
@@ -1121,7 +1883,7 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
             trail_map_hand = -1;
             return false;
         }
-        if (i == split_index)
+        if (i == split)
             left_root_inv = vrmod::RigidInverse(in);
         D3DMATRIX rel = vrmod::Multiply(in, left_root_inv);
         if (vrmod::config.weapon_scale != 1.0f)
@@ -1129,6 +1891,7 @@ inline bool SubstituteWorld(const D3DMATRIX& in, D3DMATRIX& out, bool boxed) {
         out = vrmod::Multiply(rel, grip_world_left);
         NoteTrailMap(left_root_inv, grip_world_left, 0);
         subst_sets_left++;
+        left_weapon_drew = true;
         return true;
     }
     if (!have_grip)
@@ -1174,6 +1937,7 @@ inline void OnFrame() {
     current_kind = WEAPON_KIND_NONE;
     current_is_gun = false;
     current_twin_funnel = false;
+    current_two_pass = false;
     current_twin_comp = false;
     trail_reshapes = false;
     current_projectile = 0;
@@ -1212,8 +1976,8 @@ inline void OnFrame() {
         current_is_gun = KindIsGun(current_kind);
         // The twin split's gate: the kinds that are two-handers, and any
         // weapon the held draw draws once per hand (the two-pass flag).
-        current_twin_funnel = KindSplitsFunnel(current_kind) ||
-                              (flags & WEAPON_FLAG_TWO_PASS) != 0;
+        current_two_pass = (flags & WEAPON_FLAG_TWO_PASS) != 0;
+        current_twin_funnel = KindSplitsFunnel(current_kind) || current_two_pass;
         current_twin_comp = KindSplitsComposite(current_kind);
         trail_reshapes = (attacking_fn != WEAPON_VT_NOOP || idle_fn != WEAPON_VT_NOOP) &&
                          PairReshapes(attacking_fn, current_category, variant);
@@ -1225,6 +1989,14 @@ inline void OnFrame() {
         seat_attach_bone = -1;   // re-read at the new weapon's first bracket
         seat_on_fist = false;
         draws_left_half = false;
+        left_half_drew = false;
+        passes_since_left_half = 100;
+        // passes_since_left_weapon runs on: a twin changed for another twin
+        // keeps the left hand on its half through the change. A weapon with
+        // no off-hand half lets the left hand go at once.
+        if (!MayDrawLeftHalf())
+            passes_since_left_weapon = 100;
+        left_weapon_drew = false;
         for (TrailSlot& s : trail_slots)
             s = TrailSlot();
         trail_logged = false;
@@ -1252,16 +2024,32 @@ inline void OnFrame() {
     if (current_weapon != learn_weapon) {
         learn_weapon = current_weapon;
         ResetLearning();
+        game_split_logged = false;
+        game_split_moved_logged = false;
     }
 
     // The hand-bone stash stays valid only while brackets keep drawing
     // (setting matrices, not just opening - see bracket_drew). The world
     // draws on alternating passes, so a 3-pass gap is allowed; longer
     // (unequip, menus, warps, towns) invalidates it.
-    if (bracket_drew_last_pass)
+    if (bracket_drew_last_pass) {
         passes_since_bracket = 0;
-    else if (passes_since_bracket < 100)
+    } else if (passes_since_bracket < 100) {
         passes_since_bracket++;
+    }
+    // The same for an off-hand half on the left grip (the gun seat's left hand).
+    if (left_half_drew)
+        passes_since_left_half = 0;
+    else if (passes_since_left_half < 100)
+        passes_since_left_half++;
+    left_half_drew = false;
+    // And for an off-hand half on the left grip frame by either path (the
+    // melee weapon's left hand).
+    if (left_weapon_drew)
+        passes_since_left_weapon = 0;
+    else if (passes_since_left_weapon < 100)
+        passes_since_left_weapon++;
+    left_weapon_drew = false;
     if (current_weapon == nullptr || passes_since_bracket > 3) {
         vrmod::have_hand_bone_right = false;
         vrmod::have_hand_bone_left = false;
@@ -1269,15 +2057,18 @@ inline void OnFrame() {
     have_bracket_root_raw = false;
 
     // The grip target, once per pass; no pose or no takeover = no
-    // substitution.
+    // substitution. A melee weapon goes on its own fist's seat, or on the
+    // controller's line with the hand moved onto it (MeleeDrawSeat).
+    weapons_hidden = WeaponsHiddenNow();
+    melee_on_line = MeleeOffLineWhy() == nullptr;
     have_grip = false;
     if (vrmod::config.weapon_grip && installed && gamecam::DrivesView()) {
         D3DMATRIX pose;
         if (vrmod::Get()->GetHandPose(1, pose)) {  // 1 = right hand
             D3DMATRIX hand_world;
             if (gamecam::WorldFromTracking(pose, hand_world)) {
-                const D3DMATRIX offset = ActiveGripOffset();
-                grip_world = vrmod::Multiply(offset, hand_world);
+                const D3DMATRIX offset = ActiveGripOffset(1);
+                grip_world = vrmod::Multiply(MeleeDrawSeat(), vrmod::Multiply(offset, hand_world));
                 grip_world_fist =
                     vrmod::Multiply(vrmod::Multiply(offset, FistTrim()), hand_world);
                 have_grip = true;
@@ -1295,8 +2086,8 @@ inline void OnFrame() {
         }
     }
     // The off-hand grip, whenever a weapon is held (composite brackets need
-    // it at once). Same tuple as the main hand: the grip frames are
-    // mirrored and the tuples mirror-symmetric.
+    // it at once). Same tuple as the main hand (it is mirror-symmetric);
+    // the seat is mirrored to the left hand (MirroredSeat).
     have_left_grip = false;
     if (current_weapon != nullptr && vrmod::config.twin_split &&
         vrmod::config.weapon_grip && installed && gamecam::DrivesView()) {
@@ -1304,13 +2095,27 @@ inline void OnFrame() {
         if (vrmod::Get()->GetHandPose(0, pose)) {  // 0 = left hand
             D3DMATRIX hand_world;
             if (gamecam::WorldFromTracking(pose, hand_world)) {
-                const D3DMATRIX offset = ActiveGripOffset();
-                grip_world_left = vrmod::Multiply(offset, hand_world);
+                const D3DMATRIX offset = ActiveGripOffset(0);
+                grip_world_left = vrmod::Multiply(MirroredSeat(MeleeDrawSeat()),
+                                                  vrmod::Multiply(offset, hand_world));
                 grip_world_left_fist =
                     vrmod::Multiply(vrmod::Multiply(offset, FistTrim()), hand_world);
                 have_left_grip = true;
             }
         }
+    }
+
+    {
+        weaponsnap::FrameInfo snap;
+        snap.weapon = current_weapon;
+        snap.owner = current_owner;
+        snap.category = current_category;
+        snap.kind = current_kind;
+        snap.variant = current_variant;
+        snap.split_index = split_index;
+        snap.seat_on_fist = seat_on_fist;
+        snap.expects_split = current_twin_funnel && vrmod::config.twin_split;
+        weaponsnap::OnFrame(snap);
     }
 
     if (vrmod::config.weapon_grip != prev_enabled) {
